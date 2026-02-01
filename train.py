@@ -114,7 +114,7 @@ OPTUNA_CONTINUE = 0
 USE_UNET_3L = 1
 
 # Replace all Mamba skips with Transformer (1=Transformer; 0=Mamba, fallback to conv if not installed; -1=identity pass-through)
-USE_TRANSFORMER_SKIPS = -1
+USE_TRANSFORMER_SKIPS = 0
 
 # Transformer positional encoding (1=sinusoidal on; 0=off)
 USE_TRANSFORMER_POSENC = 1
@@ -1288,19 +1288,6 @@ class DoubleConv1D(nn.Module):
         return self.net(x)
 
 
-class DoubleConv1DNoBN(nn.Module):
-    """Two conv + ReLU blocks without BatchNorm/Dropout for pure UNet mode."""
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv1d(in_channels, out_channels, 3, padding=1, bias=True),
-            nn.ReLU(inplace=True),
-            nn.Conv1d(out_channels, out_channels, 3, padding=1, bias=True),
-            nn.ReLU(inplace=True),
-        )
-
-    def forward(self, x):
-        return self.net(x)
 
 def _get_skip_mode() -> str:
     try:
@@ -1584,187 +1571,6 @@ class ClassicUNetBottleneck3L(nn.Module):
     def forward(self, x):
         return self.block(x)
 
-# ------------------------------------------------------------
-# (10=) Simple U-Net encoder/decoder (for PURE mode)
-# ------------------------------------------------------------
-class SimpleUNetEncoder(nn.Module):
-    def __init__(self, input_channels=3, base_channels=BASE_CHANNELS):
-        super().__init__()
-        self.enc0 = DoubleConv1DNoBN(input_channels, base_channels)
-        self.pool0 = nn.MaxPool1d(2)  # 1024 -> 512
-
-        self.enc1 = DoubleConv1DNoBN(base_channels, base_channels)  # 512
-        self.pool1 = nn.MaxPool1d(2)  # 512 -> 256
-
-        self.enc2 = DoubleConv1DNoBN(base_channels, base_channels * 2)  # 256
-        self.pool2 = nn.MaxPool1d(2)  # 256 -> 128
-
-        self.enc3 = DoubleConv1DNoBN(base_channels * 2, base_channels * 4)  # 128
-        self.pool3 = nn.MaxPool1d(2)  # 128 -> 64
-
-        self.enc4 = DoubleConv1DNoBN(base_channels * 4, base_channels * 8)  # 64
-
-    def forward(self, x):
-        features = []
-        x = self.enc0(x)
-        x = self.pool0(x)
-        features.append(x)  # f0: [B, base, 512]
-
-        x = self.enc1(x)
-        features.append(x)  # f1: [B, base, 512]
-
-        x = self.pool1(x)
-        x = self.enc2(x)
-        features.append(x)  # f2: [B, 2*base, 256]
-
-        x = self.pool2(x)
-        x = self.enc3(x)
-        features.append(x)  # f3: [B, 4*base, 128]
-
-        x = self.pool3(x)
-        x = self.enc4(x)
-        features.append(x)  # f4: [B, 8*base, 64]
-        return features
-
-
-class SimpleUNetDecoder(nn.Module):
-    def __init__(self, base_channels=BASE_CHANNELS):
-        super().__init__()
-        # Identity skip refinement blocks (no Mamba)
-        self.skip_blocks = nn.ModuleList([
-            nn.Identity(), nn.Identity(), nn.Identity(), nn.Identity()
-        ])
-
-        self.up4 = nn.Upsample(scale_factor=2, mode='linear', align_corners=True)
-        self.conv4 = DoubleConv1DNoBN(base_channels * 8 + base_channels * 4, base_channels * 4)
-
-        self.up3 = nn.Upsample(scale_factor=2, mode='linear', align_corners=True)
-        self.conv3 = DoubleConv1DNoBN(base_channels * 4 + base_channels * 2, base_channels * 2)
-
-        self.up2 = nn.Upsample(scale_factor=2, mode='linear', align_corners=True)
-        self.conv2 = DoubleConv1DNoBN(base_channels * 2 + base_channels, base_channels)
-
-        self.up1 = nn.Upsample(scale_factor=2, mode='linear', align_corners=True)
-        self.conv1 = DoubleConv1DNoBN(base_channels + base_channels, base_channels)
-
-        self.final_conv = nn.Conv1d(base_channels, 1, 1)
-
-    def _forward_to_last_feature(self, features, bottleneck_out):
-        f0, f1, f2, f3, _ = features
-        x = bottleneck_out  # [B, 8*base, 64]
-
-        x = self.up4(x)  # -> 128
-        skip3 = self.skip_blocks[0](f3)
-        x = torch.cat([x, skip3], dim=1)
-        x = self.conv4(x)
-
-        x = self.up3(x)  # -> 256
-        skip2 = self.skip_blocks[1](f2)
-        x = torch.cat([x, skip2], dim=1)
-        x = self.conv3(x)
-
-        x = self.up2(x)  # -> 512
-        skip1 = self.skip_blocks[2](f1)
-        x = torch.cat([x, skip1], dim=1)
-        x = self.conv2(x)
-
-        x = self.up1(x)  # -> 1024
-        skip0 = self.up1(f0)
-        skip0 = self.skip_blocks[3](skip0)
-        x = torch.cat([x, skip0], dim=1)
-        x = self.conv1(x)
-        return x
-
-    def forward(self, features, bottleneck_out):
-        x = self._forward_to_last_feature(features, bottleneck_out)
-        x = self.final_conv(x)
-        return x.squeeze(1)
-
-    def forward_with_last_feature(self, features, bottleneck_out):
-        x = self._forward_to_last_feature(features, bottleneck_out)
-        out = self.final_conv(x)
-        return x, out.squeeze(1)
-
-class SimpleUNetEncoder3L(nn.Module):
-    def __init__(self, input_channels=3, base_channels=BASE_CHANNELS):
-        super().__init__()
-        self.enc0 = DoubleConv1DNoBN(input_channels, base_channels)
-        self.pool0 = nn.MaxPool1d(2)  # 1024 -> 512
-
-        self.enc1 = DoubleConv1DNoBN(base_channels, base_channels)  # 512
-        self.pool1 = nn.MaxPool1d(2)  # 512 -> 256
-
-        self.enc2 = DoubleConv1DNoBN(base_channels, base_channels * 2)  # 256
-        self.pool2 = nn.MaxPool1d(2)  # 256 -> 128
-
-        self.enc3 = DoubleConv1DNoBN(base_channels * 2, base_channels * 4)  # 128
-
-    def forward(self, x):
-        features = []
-        x = self.enc0(x)
-        x = self.pool0(x)
-        features.append(x)  # f0: [B, base, 512]
-
-        x = self.enc1(x)
-        features.append(x)  # f1: [B, base, 512]
-
-        x = self.pool1(x)
-        x = self.enc2(x)
-        features.append(x)  # f2: [B, 2*base, 256]
-
-        x = self.pool2(x)
-        x = self.enc3(x)
-        features.append(x)  # f3: [B, 4*base, 128]
-        return features
-
-class SimpleUNetDecoder3L(nn.Module):
-    def __init__(self, base_channels=BASE_CHANNELS):
-        super().__init__()
-        self.skip_blocks = nn.ModuleList([
-            nn.Identity(), nn.Identity(), nn.Identity()
-        ])
-
-        self.up3 = nn.Upsample(scale_factor=2, mode='linear', align_corners=True)
-        self.conv3 = DoubleConv1DNoBN(base_channels * 4 + base_channels * 2, base_channels * 2)
-
-        self.up2 = nn.Upsample(scale_factor=2, mode='linear', align_corners=True)
-        self.conv2 = DoubleConv1DNoBN(base_channels * 2 + base_channels, base_channels)
-
-        self.up1 = nn.Upsample(scale_factor=2, mode='linear', align_corners=True)
-        self.conv1 = DoubleConv1DNoBN(base_channels + base_channels, base_channels)
-
-        self.final_conv = nn.Conv1d(base_channels, 1, 1)
-
-    def _forward_to_last_feature(self, features, bottleneck_out):
-        f0, f1, f2, _ = features
-        x = bottleneck_out  # [B, 4*base, 128]
-
-        x = self.up3(x)
-        skip2 = self.skip_blocks[0](f2)
-        x = torch.cat([x, skip2], dim=1)
-        x = self.conv3(x)
-
-        x = self.up2(x)
-        skip1 = self.skip_blocks[1](f1)
-        x = torch.cat([x, skip1], dim=1)
-        x = self.conv2(x)
-
-        x = self.up1(x)
-        skip0 = self.up1(f0)
-        skip0 = self.skip_blocks[2](skip0)
-        x = torch.cat([x, skip0], dim=1)
-        x = self.conv1(x)
-        return x
-
-    def forward(self, features, bottleneck_out):
-        x = self._forward_to_last_feature(features, bottleneck_out)
-        x = self.final_conv(x)
-        return x.squeeze(1)
-
-    def forward_with_last_feature(self, features, bottleneck_out):
-        x = self._forward_to_last_feature(features, bottleneck_out)
-        out = self.final_conv(x)
-        return x, out.squeeze(1)
 
 
 # ------------------------------------------------------------
