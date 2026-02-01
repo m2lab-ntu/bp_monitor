@@ -2,7 +2,7 @@
 
 **Blood Pressure Estimation**
 
-A concise and professional implementation of a **two-stage, cuff-less blood-pressure estimation pipeline** based on **photoplethysmography (PPG)** and **electrocardiography (ECG Lead II)** signals. The project converts raw waveform data into machine-learning friendly segments, conducts subject-wise stratified splits, and trains an **Improved ResNet** (min–max prediction) in parallel with a **U-Net** (waveform reconstruction). Hyper-parameter optimisation is performed with **Optuna**.
+A concise and professional implementation of a **two-stage, cuff-less blood-pressure estimation pipeline** based on **photoplethysmography (PPG)** and **electrocardiography (ECG Lead II)** signals. The project converts raw waveform data into machine-learning friendly segments, conducts subject-wise stratified splits, and trains an Improved ResNet (min–max prediction) in parallel with a U-Net (waveform reconstruction). In addition, the U-Net incorporates sequence modeling via Mamba/Transformer blocks. 
 
 ---
 
