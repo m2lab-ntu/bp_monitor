@@ -44,7 +44,7 @@ os.makedirs(processed_dir, exist_ok=True)
 
 # Fast start and performance/stability options
 REUSE_PROCESSED = True # Force no re-processing; if True, load existing .npz and splits
-# New: split mode 'subject' or 'segment' (random segment split)
+# Split mode 'subject' or 'segment' (random segment split)
 SPLIT_MODE = "subject"  # Options: "subject" or "segment"
 SPLIT_JSON_PATH = os.path.join(processed_dir, "split_subjects.json")  # Save/load subject split
 USE_COMPILE = True  # PyTorch 2.x can speed up
@@ -400,7 +400,7 @@ def read_subject_file_map(map_csv_path):
     mapping = dict(zip(used_df["csv_path"], used_df["subject_id"]))
     return mapping, used_df
 
-# New: read multiple mappings and merge
+# Read multiple mappings and merge
 def read_subject_file_maps(map_csv_paths):
     rows = []
     merged_mapping = {}
@@ -741,7 +741,7 @@ def infer_subject_splits_from_npz(train_ratio=0.7, val_ratio=0.1, test_ratio=0.2
 
     return set(bins[0]), set(bins[1]), set(bins[2])
 
-# New: random segment split from existing .npz (ignore subject)
+# Random segment split from existing .npz (ignore subject)
 def random_segment_split_from_existing_npz(train_ratio=0.7, val_ratio=0.1, test_ratio=0.2, seed=42):
     files = glob.glob(os.path.join(processed_dir, "*.npz"))
     if not files:
@@ -1144,7 +1144,7 @@ class ResNetBlock(nn.Module):
         self.bn2 = nn.BatchNorm1d(out_channels)
         self.downsample = downsample
         self.stride = stride
-        # New: dropout
+        # Dropout
         self.dropout = nn.Dropout(DROPOUT_P)
 
     def forward(self, x):
@@ -1158,7 +1158,7 @@ class ResNetBlock(nn.Module):
 
         out += identity
         out = F.relu(out)
-        # New: dropout
+        # Dropout
         out = self.dropout(out)
         return out
 
@@ -2953,7 +2953,7 @@ def test_model(model, test_list, device, collect_errors: bool = False):
         sbp_mean_total_n, sbp_mean_sum_e, sbp_mean_sum_abs_e, sbp_mean_sum_e2
     )
     sbp_mean_r_global = _finalize_segmean_r(sbp_mean_true_list, sbp_mean_pred_list)
-    # New: finalize SBP seg-mean filtered metrics (SBP<=170 and SBP<=160)
+    # Finalize SBP seg-mean filtered metrics (SBP<=170 and SBP<=160)
     sbp_mean_me_global_filt170, sbp_mean_mae_global_filt170, sbp_mean_sd_global_filt170, sbp_mean_rmse_global_filt170 = _finalize_segmean_metrics(
         sbp_mean_total_n_filt170, sbp_mean_sum_e_filt170, sbp_mean_sum_abs_e_filt170, sbp_mean_sum_e2_filt170
     )
@@ -3000,7 +3000,7 @@ def test_model(model, test_list, device, collect_errors: bool = False):
             'RMSE': sbp_mean_rmse_global,
             'R': sbp_mean_r_global,
         },
-        # New: SBP seg-mean filtered groups
+        # SBP seg-mean filtered groups
         'global_sbp_mean_metrics_filtered170': {
             'N': sbp_mean_total_n_filt170,
             'ME': sbp_mean_me_global_filt170,
