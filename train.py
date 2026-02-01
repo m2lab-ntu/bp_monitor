@@ -1322,52 +1322,23 @@ class IdentitySkipBlock(nn.Module):
 
 
 class MambaSkipBlock(nn.Module):
-    _warned = False
-
     def __init__(self, channels: int, d_state: int = 16, d_conv: int = 4,
                  expand: int = 2, dropout: float = DROPOUT_P):
         super().__init__()
         self.channels = channels
-        self.use_mamba = (Mamba is not None)
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-
-        if self.use_mamba:
-            self.norm = nn.LayerNorm(channels)
-            self.core = Mamba(d_model=channels, d_state=d_state, d_conv=d_conv, expand=expand)
-        else:
-            self.norm = nn.Identity()
-            self.fallback_norm = nn.BatchNorm1d(channels)
-            self.depthwise = nn.Conv1d(
-                channels, channels, kernel_size=5, padding=2, groups=channels, bias=False
-            )
-            self.pointwise = nn.Conv1d(channels, channels, kernel_size=1, bias=False)
-            self.activation = nn.SiLU()
-            self.fallback_bn = nn.BatchNorm1d(channels)
-            self._maybe_warn()
-
-    def _maybe_warn(self):
-        if not MambaSkipBlock._warned:
-            warnings.warn(
-                "mamba_ssm not installed; using depthwise-conv fallback for MambaSkipBlock.",
-                RuntimeWarning,
-            )
-            MambaSkipBlock._warned = True
+        if Mamba is None:
+            raise ImportError("mamba_ssm is not installed; MambaSkipBlock requires mamba_ssm.")
+        self.norm = nn.LayerNorm(channels)
+        self.core = Mamba(d_model=channels, d_state=d_state, d_conv=d_conv, expand=expand)
 
     def forward(self, x):
         residual = x
-        if self.use_mamba:
-            seq = x.transpose(1, 2)           # [B, L, C]
-            seq = self.norm(seq)
-            seq = self.core(seq)
-            seq = self.dropout(seq)
-            seq = seq.transpose(1, 2)         # [B, C, L]
-        else:
-            seq = self.fallback_norm(x)
-            seq = self.depthwise(seq)
-            seq = self.activation(seq)
-            seq = self.pointwise(seq)
-            seq = self.fallback_bn(seq)
-            seq = self.dropout(seq)
+        seq = x.transpose(1, 2)           # [B, L, C]
+        seq = self.norm(seq)
+        seq = self.core(seq)
+        seq = self.dropout(seq)
+        seq = seq.transpose(1, 2)         # [B, C, L]
         return seq + residual
 
 
