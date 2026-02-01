@@ -13,8 +13,6 @@ A concise and professional implementation of a **two-stage, cuff-less blood-pres
 | `pre_train.py`         | Converts raw *WFDB* `.dat` files to cleaned CSV (PPG, ECG (Lead II), dPPG, ABP). |
 | `train.py`             | End-to-end preprocessing, stratified split, Optuna optimisation, model training & evaluation. |
 | `processed_minmax/`    | Auto-generated .npz segments (features, labels, metadata). |
-| `results*/`            | Time-stamped folders containing metrics, plots, and best model weights. |
-| `optuna_plots/`        | Saved optimisation history & parameter-importance charts. |
 
 ---
 
