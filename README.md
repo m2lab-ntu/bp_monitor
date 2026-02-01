@@ -13,16 +13,18 @@ A concise and professional implementation of a **two-stage, cuff-less blood-pres
 | `pre_train.py`         | Converts raw *WFDB* `.dat` files to cleaned CSV (PPG, ECG (Lead II), dPPG, ABP). |
 | `train.py`             | End-to-end preprocessing, stratified split, Optuna optimisation, model training & evaluation. |
 | `processed_minmax/`    | Auto-generated .npz segments (features, labels, metadata). |
+| `environment.yml`      | Conda environment definition for reproducing the training kernel. |
 
 ---
 
 ## 2. Requirements
 
-* **Python 3.8+**
-* GPU with CUDA 11+ (optional but recommended)
-* `pip install -r requirements.txt`
-  * core: `numpy pandas scipy matplotlib tqdm scikit-learn`
-  * deep learning: `tensorflow keras`
-  * optimisation / I/O: `optuna wfdb`
+* **Python 3.12+**
+* **Conda**
+* GPU with CUDA
+* Create environment from `environment.yml`
+  * core: `numpy`, `pandas`, `scipy`, `matplotlib`, `tqdm`, `scikit-learn`
+  * deep learning: `pytorch`
+  * sequence modeling: `mamba-ssm`, `transformers`
 
 ---
