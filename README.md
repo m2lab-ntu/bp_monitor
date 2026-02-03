@@ -26,7 +26,7 @@ A two-stage, cuff-less blood-pressure estimation pipeline using **PPG** and **EC
 2. Activate the environment before running any script.
 3. CUDA GPU is recommended for training.
 
-Example:
+Run:
 ```bash
 conda env create -f environment.yml
 conda activate bp_monitor
@@ -36,7 +36,6 @@ conda activate bp_monitor
 
 ## 3. Data Preparation
 
-### 3.1 Raw-to-CSV (optional)
 If your raw data is in WFDB `.dat` format, use `pre_train.py` to generate CSV files containing:
 - `PLETH` (PPG)
 - `II` (ECG Lead II)
@@ -47,19 +46,6 @@ Run:
 ```bash
 python pre_train.py
 ```
-
-### 3.2 Subject File Map
-`train.py` expects one or more *subject file maps* to locate CSV files and assign subject IDs. Example columns:
-- `subject_id`
-- `input_file` (raw filename, optional)
-- `output_csv` (preferred CSV filename, optional)
-
-Paths are configured in `train.py`:
-- `SUBJECT_FILE_MAP_PATHS`
-- `data_paths`
-- `processed_dir`
-
-Make sure you update these to your local data directories before running.
 
 ---
 
@@ -73,22 +59,12 @@ python train.py
 Key configuration options in `train.py`:
 - `REUSE_PROCESSED`: reuse existing `.npz` segments.
 - `SPLIT_MODE`: `subject` or `segment`.
-- `USE_UNET_3L`: enable 3-level UNet.
-- `USE_TRANSFORMER_SKIPS`: use Transformer or Mamba in skip blocks.
-- `OPTUNA_USE`: enable Optuna hyperparameter search.
 
-Artifacts produced:
-- `processed_minmax/*.npz`
-- `split_subjects.json`
-- `subject_file_map_result.csv`
-- `abp_normalization_stats.json`
-- `best_<run_name>.pth` (checkpoint)
 
 ---
 
 ## 5. Test / Evaluation
 
-### 5.1 Test-only Run
 Run evaluation without training:
 ```bash
 python test.py
@@ -100,12 +76,6 @@ The test-only flow reads:
 
 These are configured in `train.py`. You can also run test-only by setting:
 - `TEST_ONLY_MODE=1` in `train.py`
-
-### 5.2 Metrics
-Evaluation includes:
-- Waveform MAE, ME, SD, RMSE
-- Segment-level SBP/DBP metrics
-- Optional Ridge regression probe on decoder features
 
 ---
 
@@ -126,6 +96,5 @@ You can change the output directory or timestamp format in `train.py`:
 
 - Ensure `data_paths`, `processed_dir`, and `SUBJECT_FILE_MAP_PATHS` are updated for your machine.
 - If `REUSE_PROCESSED=True`, training will skip CSV processing and use existing `.npz` files.
-- Checkpoints are saved with a timestamped backup and a stable `best_<run_name>.pth` for convenience.
 
 ---
