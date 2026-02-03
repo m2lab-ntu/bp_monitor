@@ -74,21 +74,11 @@ The test-only flow reads:
 - `TEST_ONLY_CHECKPOINT`
 - `TEST_ONLY_STATS_PATH`
 
-These are configured in `train.py`. You can also run test-only by setting:
-- `TEST_ONLY_MODE=1` in `train.py`
-
 ---
 
 ## 6. Plots
 
-All plots are saved to `plots/` with timestamps in the filename. There is no inline display. Plot toggles:
-- `ENABLE_PLOT_PRETRAIN_DISTRIBUTIONS`
-- `ENABLE_PLOT_BA_SCATTER`
-- `ENABLE_PLOT_TRUEPRED_SCATTER`
-
-You can change the output directory or timestamp format in `train.py`:
-- `PLOT_OUTPUT_DIR`
-- `PLOT_TIMESTAMP_FMT`
+All plots are saved to `plots/` with timestamps in the filename.
 
 ---
 
