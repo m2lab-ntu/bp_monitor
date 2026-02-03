@@ -59,7 +59,8 @@ python train.py
 Key configuration options in `train.py`:
 - `REUSE_PROCESSED`: reuse existing `.npz` segments.
 - `SPLIT_MODE`: `subject` or `segment`.
-
+- `USE_TRANSFORMER_SKIPS`: use Transformer or Mamba in skip blocks.
+- `OPTUNA_USE`: enable Optuna hyperparameter search.
 
 ---
 
