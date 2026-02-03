@@ -2,7 +2,7 @@
 
 **Blood Pressure Estimation**
 
-A concise and professional implementation of a **two-stage, cuff-less blood-pressure estimation pipeline** based on **photoplethysmography (PPG)** and **electrocardiography (ECG Lead II)** signals. The project converts raw waveform data into machine-learning friendly segments, conducts subject-wise stratified splits, and trains an Improved ResNet (min–max prediction) in parallel with a U-Net (waveform reconstruction). In addition, the U-Net incorporates sequence modeling via Mamba/Transformer blocks. 
+A two-stage, cuff-less blood-pressure estimation pipeline using **PPG** and **ECG (Lead II)** signals. The workflow converts raw waveforms into fixed-length segments, performs subject-wise stratified splitting, and trains a ResNet-UNet model for ABP waveform reconstruction with optional Mamba/Transformer skip refinement.
 
 ---
 
@@ -10,21 +10,122 @@ A concise and professional implementation of a **two-stage, cuff-less blood-pres
 
 | Path / File            | Purpose |
 |------------------------|---------|
-| `pre_train.py`         | Converts raw *WFDB* `.dat` files to cleaned CSV (PPG, ECG (Lead II), dPPG, ABP). |
-| `train.py`             | End-to-end preprocessing, stratified split, Optuna optimisation, model training & evaluation. |
-| `processed_minmax/`    | Auto-generated .npz segments (features, labels, metadata). |
-| `environment.yml`      | Conda environment definition for reproducing the training kernel. |
+| `pre_train.py`         | Converts raw *WFDB* `.dat` files to cleaned CSV (PPG, ECG, dPPG, ABP). |
+| `model.py`             | Model architectures, skip blocks, and loss functions. |
+| `train.py`             | End-to-end preprocessing, stratified split, Optuna optimisation, model training. |
+| `test.py`              | Evaluation utilities and test-only execution. |
+| `processed_minmax/`    | Auto-generated `.npz` segments (features, labels, metadata). |
+| `plots/`               | Saved figures (timestamped filenames). |
+| `environment.yml`      | Conda environment definition. |
 
 ---
 
-## 2. Requirements
+## 2. Environment Setup
 
-* **Python 3.12+**
-* **Conda**
-* GPU with CUDA
-* Create environment from `environment.yml`
-  * core: `numpy`, `pandas`, `scipy`, `matplotlib`, `tqdm`, `scikit-learn`
-  * deep learning: `pytorch`
-  * sequence modeling: `mamba-ssm`, `transformers`
+1. Create conda environment from `environment.yml`.
+2. Activate the environment before running any script.
+3. CUDA GPU is recommended for training.
+
+Example:
+```bash
+conda env create -f environment.yml
+conda activate bp_monitor
+```
+
+---
+
+## 3. Data Preparation
+
+### 3.1 Raw-to-CSV (optional)
+If your raw data is in WFDB `.dat` format, use `pre_train.py` to generate CSV files containing:
+- `PLETH` (PPG)
+- `II` (ECG Lead II)
+- `dPPG`
+- `ABP`
+
+Run:
+```bash
+python pre_train.py
+```
+
+### 3.2 Subject File Map
+`train.py` expects one or more *subject file maps* to locate CSV files and assign subject IDs. Example columns:
+- `subject_id`
+- `input_file` (raw filename, optional)
+- `output_csv` (preferred CSV filename, optional)
+
+Paths are configured in `train.py`:
+- `SUBJECT_FILE_MAP_PATHS`
+- `data_paths`
+- `processed_dir`
+
+Make sure you update these to your local data directories before running.
+
+---
+
+## 4. Training
+
+Run full preprocessing + training:
+```bash
+python train.py
+```
+
+Key configuration options in `train.py`:
+- `REUSE_PROCESSED`: reuse existing `.npz` segments.
+- `SPLIT_MODE`: `subject` or `segment`.
+- `USE_UNET_3L`: enable 3-level UNet.
+- `USE_TRANSFORMER_SKIPS`: use Transformer or Mamba in skip blocks.
+- `OPTUNA_USE`: enable Optuna hyperparameter search.
+
+Artifacts produced:
+- `processed_minmax/*.npz`
+- `split_subjects.json`
+- `subject_file_map_result.csv`
+- `abp_normalization_stats.json`
+- `best_<run_name>.pth` (checkpoint)
+
+---
+
+## 5. Test / Evaluation
+
+### 5.1 Test-only Run
+Run evaluation without training:
+```bash
+python test.py
+```
+
+The test-only flow reads:
+- `TEST_ONLY_CHECKPOINT`
+- `TEST_ONLY_STATS_PATH`
+
+These are configured in `train.py`. You can also run test-only by setting:
+- `TEST_ONLY_MODE=1` in `train.py`
+
+### 5.2 Metrics
+Evaluation includes:
+- Waveform MAE, ME, SD, RMSE
+- Segment-level SBP/DBP metrics
+- Optional Ridge regression probe on decoder features
+
+---
+
+## 6. Plots
+
+All plots are saved to `plots/` with timestamps in the filename. There is no inline display. Plot toggles:
+- `ENABLE_PLOT_PRETRAIN_DISTRIBUTIONS`
+- `ENABLE_PLOT_BA_SCATTER`
+- `ENABLE_PLOT_TRUEPRED_SCATTER`
+
+You can change the output directory or timestamp format in `train.py`:
+- `PLOT_OUTPUT_DIR`
+- `PLOT_TIMESTAMP_FMT`
+
+---
+
+## 7. Notes
+
+- Ensure `data_paths`, `processed_dir`, and `SUBJECT_FILE_MAP_PATHS` are updated for your machine.
+- If `REUSE_PROCESSED=True`, training will skip CSV processing and use existing `.npz` files.
+- Checkpoints are saved with a timestamped backup and a stable `best_<run_name>.pth` for convenience.
 
 ---
