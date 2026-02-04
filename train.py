@@ -108,7 +108,7 @@ OPTUNA_CONTINUE = 0
 # UNet depth: 1=use 3-layer (one less) version; 0=use original 4-layer version
 USE_UNET_3L = 1
 
-# Replace all Mamba skips with Transformer (1=Transformer; 0=Mamba, fallback to conv if not installed; -1=identity pass-through)
+# Replace all Mamba skips with Transformer (1=Transformer; 0=Mamba; -1=identity)
 USE_TRANSFORMER_SKIPS = 0
 
 # Transformer positional encoding (1=sinusoidal on; 0=off)
