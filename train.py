@@ -129,7 +129,7 @@ BOTTLENECK_RIDGE_USE_TRAIN_VAL = True
 # Test-only mode (no training, test only)
 # ------------------------------------------------------------
 TEST_ONLY_MODE = 0          # 1=enable test-only; 0=normal train/val/test
-TEST_ONLY_CHECKPOINT = "pth/best_resnet_unet3l_transformer_20251221-210708_papagei_regression.pth"         # Set .pth weight path (empty uses best_{run_name}.pth)
+TEST_ONLY_CHECKPOINT = "Setpth.pth"         # Set .pth weight path (empty uses best_{run_name}.pth)
 TEST_ONLY_USE_SAVED_STATS = True  # Prefer loading saved normalization stats
 TEST_ONLY_STATS_PATH = "abp_normalization_stats.json"
 TEST_ONLY_VISUALIZE = True         # Whether to plot predictions for some test segments
