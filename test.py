@@ -164,7 +164,7 @@ def _collect_decoder_embeddings_xy(file_list, model, device, desc_tag="train"):
     skipped = 0
 
     with torch.no_grad():
-        for fp in tqdm(file_list, desc=f"Extracting bottleneck embeddings ({desc_tag})"):
+        for fp in tqdm(file_list, desc=f"Extracting embeddings ({desc_tag})"):
             X, Y, _, _ = train_mod.load_segment(fp)
             if X is None or Y is None:
                 skipped += 1
