@@ -76,9 +76,8 @@ Which architecture runs is set by `MODEL` at the top of `train.py`.
 
 Key configuration options in `train.py`:
 - `REUSE_PROCESSED`: reuse existing `.npz` segments.
-- `SPLIT_MODE`: `subject` (the supported mode).
 - `USE_KFOLD`: 5 subject-wise folds.
-- `N_VALUES`: calibration window counts to evaluate, in order.
+- `USE_OPTUNA_LR_SEARCH`: Optuna search before training.
 - `batch_size`, `epochs`, `learning_rate`.
 
 ---
