@@ -85,6 +85,8 @@ Key configuration options in `train.py`:
 
 ## 5. Test / Evaluation
 
+`train.py` runs the evaluation itself after each variant finishes training.
+
 Evaluation includes:
 - Waveform MAE, ME, SD, RMSE
 - Ridge regression
