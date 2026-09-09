@@ -18,8 +18,6 @@ A two-stage, cuff-less blood-pressure estimation pipeline using PPG and ECG sign
 
 ### Choosing a model
 
-Each model trains **exactly one** variant per run:
-
 No calibration:
 - `unet_plain_nocal`
 - `unet_mamba_skip`
