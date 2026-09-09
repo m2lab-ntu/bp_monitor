@@ -16,22 +16,6 @@ A two-stage, cuff-less blood-pressure estimation pipeline using PPG and ECG sign
 | `test.py`              | Evaluation. |
 | `environment.yml`      | Conda environment definition. |
 
-### Choosing a model
-
-No calibration:
-- `unet_plain_nocal`
-- `unet_mamba_skip`
-- `unet_mamba_decoder`
-- `unet_transformer_skip`
-- `unet_transformer_decoder`
-
-Calibrated:
-- `unet_cal`
-- `unet_cal_mamba`
-- `unet_cal_transformer`
-- `unet_cal_abp_ft`
-- `unet_cal_bp_ft`
-
 ---
 
 ## 2. Environment Setup
@@ -71,6 +55,22 @@ python train.py
 ```
 
 Which architecture runs is set by `MODEL` at the top of `train.py`.
+
+### Choosing a model
+
+No calibration:
+- `unet_plain_nocal`
+- `unet_mamba_skip`
+- `unet_mamba_decoder`
+- `unet_transformer_skip`
+- `unet_transformer_decoder`
+
+Calibrated:
+- `unet_cal`
+- `unet_cal_mamba`
+- `unet_cal_transformer`
+- `unet_cal_abp_ft`
+- `unet_cal_bp_ft`
 
 Key configuration options in `train.py`:
 - `REUSE_PROCESSED`: reuse existing `.npz` segments.
