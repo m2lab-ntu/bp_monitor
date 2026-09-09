@@ -56,7 +56,6 @@ conda activate mamba_6_op
 If your raw data is in WFDB `.dat` format, use `pre_train.py` to generate CSV files containing:
 - `PLETH` (PPG)
 - `II` (ECG Lead II)
-- `dPPG`
 - `ABP`
 
 Run:
@@ -88,12 +87,4 @@ Key configuration options in `train.py`:
 
 Evaluation includes:
 - Waveform MAE, ME, SD, RMSE
-- Segment-level SBP/DBP metrics
-- Optional Ridge regression probe on decoder features
-
----
-
-## 6. Plots
-
-Plots are saved into the current run directory under `runs/`, with
-timestamps in the filename.
+- Ridge regression
