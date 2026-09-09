@@ -2,7 +2,7 @@
 
 **Blood Pressure Estimation**
 
-A two-stage, cuff-less blood-pressure estimation pipeline using **PPG** and **ECG (Lead II)** signals. The workflow converts raw waveforms into fixed-length segments, performs subject-wise stratified splitting, and trains a ResNet-UNet model for ABP waveform reconstruction with optional Mamba/Transformer skip refinement.
+A two-stage, cuff-less blood-pressure estimation pipeline using PPG and ECG signals. The workflow converts raw waveforms into fixed-length segments, performs subject-wise stratified data splitting, and trains a U-Net model to reconstruct the ABP waveform.
 
 ---
 
@@ -11,12 +11,28 @@ A two-stage, cuff-less blood-pressure estimation pipeline using **PPG** and **EC
 | Path / File            | Purpose |
 |------------------------|---------|
 | `pre_train.py`         | Converts raw *WFDB* `.dat` files to cleaned CSV (PPG, ECG, dPPG, ABP). |
-| `model.py`             | Model architectures, skip blocks, and loss functions. |
-| `train.py`             | End-to-end preprocessing, stratified split, Optuna optimisation, model training. |
-| `test.py`              | Evaluation utilities and test-only execution. |
-| `processed_minmax/`    | Auto-generated `.npz` segments (features, labels, metadata). |
-| `plots/`               | Saved figures (timestamped filenames). |
+| `models/`              | Model architectures and the registry. |
+| `train.py`             | End-to-end preprocessing, k-fold split, per-master adapter fine-tune, Optuna LR search, model training. |
+| `test.py`              | Evaluation. |
 | `environment.yml`      | Conda environment definition. |
+
+### Choosing a model
+
+Each model trains **exactly one** variant per run:
+
+No calibration:
+- `unet_plain_nocal`
+- `unet_mamba_skip`
+- `unet_mamba_decoder`
+- `unet_transformer_skip`
+- `unet_transformer_decoder`
+
+Calibrated:
+- `unet_cal`
+- `unet_cal_mamba`
+- `unet_cal_transformer`
+- `unet_cal_abp_ft`
+- `unet_cal_bp_ft`
 
 ---
 
@@ -26,16 +42,17 @@ A two-stage, cuff-less blood-pressure estimation pipeline using **PPG** and **EC
 2. Activate the environment before running any script.
 3. CUDA GPU is recommended for training.
 
-Run:
+Example:
 ```bash
 conda env create -f environment.yml
-conda activate bp_monitor
+conda activate mamba_6_op
 ```
 
 ---
 
 ## 3. Data Preparation
 
+### Raw-to-CSV
 If your raw data is in WFDB `.dat` format, use `pre_train.py` to generate CSV files containing:
 - `PLETH` (PPG)
 - `II` (ECG Lead II)
@@ -56,36 +73,27 @@ Run full preprocessing + training:
 python train.py
 ```
 
+Which architecture runs is set by `MODEL` at the top of `train.py`.
+
 Key configuration options in `train.py`:
 - `REUSE_PROCESSED`: reuse existing `.npz` segments.
-- `SPLIT_MODE`: `subject` or `segment`.
-- `USE_TRANSFORMER_SKIPS`: use Transformer or Mamba in skip blocks.
-- `OPTUNA_USE`: enable Optuna hyperparameter search.
+- `SPLIT_MODE`: `subject` (the supported mode).
+- `USE_KFOLD`: 5 subject-wise folds.
+- `N_VALUES`: calibration window counts to evaluate, in order.
+- `batch_size`, `epochs`, `learning_rate`.
 
 ---
 
 ## 5. Test / Evaluation
 
-Run evaluation without training:
-```bash
-python test.py
-```
-
-The test-only flow reads:
-- `TEST_ONLY_CHECKPOINT`
-- `TEST_ONLY_STATS_PATH`
+Evaluation includes:
+- Waveform MAE, ME, SD, RMSE
+- Segment-level SBP/DBP metrics
+- Optional Ridge regression probe on decoder features
 
 ---
 
 ## 6. Plots
 
-All plots are saved to `plots/` with timestamps in the filename.
-
----
-
-## 7. Notes
-
-- Ensure `data_paths`, `processed_dir`, and `SUBJECT_FILE_MAP_PATHS` are updated for your machine.
-- If `REUSE_PROCESSED=True`, training will skip CSV processing and use existing `.npz` files.
-
----
+Plots are saved into the current run directory under `runs/`, with
+timestamps in the filename.
