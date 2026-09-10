@@ -59,7 +59,7 @@ Which architecture runs is set by `MODEL` at the top of `train.py`.
 ### Choosing a model
 
 No calibration:
-- `unet_plain_nocal`
+- `unet`
 - `unet_mamba_skip`
 - `unet_mamba_decoder`
 - `unet_transformer_skip`
