@@ -1,5 +1,5 @@
 # No-calibration U-Net with decoder-gated refiners on the two deep skips:
-# a Mamba gate (MambaUNet3LNoCal) or a Transformer / Conformer gate (TransformerUNet3LNoCal).
+# a Mamba gate or a Transformer gate.
 import math
 from typing import Optional
 
