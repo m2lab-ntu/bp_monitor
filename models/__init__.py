@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import importlib
-from dataclasses import dataclass
+import sys
+from dataclasses import dataclass, field
 from types import ModuleType
-from typing import Any, Tuple
+from typing import Any, Mapping, Tuple
 
 # Fallback only; the switch is MODEL in train.py.
 MODEL = "unet_cal_mamba"
@@ -24,6 +25,11 @@ RUN_MODES = (RUN_CALIBRATED_ONLY, RUN_NO_CAL_ONLY,
 # Decoder-ridge probe alpha grid.
 _RIDGE_GRID = (0.1, 1.0, 10.0, 100.0, 1000.0)
 
+# Architecture families, one module each. Keys that share a module differ only in module_config.
+CAL = "unet_cal"                      # CalibrationUNet with a switchable skip refiner
+NOCAL_SKIP = "unet_nocal_skip"        # no-cal U-Net, Mamba / Transformer / Conformer gates on the skips
+NOCAL_DECODER = "unet_nocal_decoder"  # no-cal U-Net, Mamba / Transformer refiners inside the decoder
+
 
 @dataclass(frozen=True)
 # Spec
@@ -32,7 +38,13 @@ class ModelSpec:
     key: str
     module: str
     summary: str
-    source_project: str
+
+    # Module constants set on the model module before anything is built, e.g. SKIP_REFINER.
+    module_config: Mapping[str, Any] = field(default_factory=dict)
+
+    # Learning rate for decoder.ag* (skip gates / in-decoder refiners) in train.py;
+    # None = the whole model trains at learning_rate.
+    gate_learning_rate: float | None = None
 
     # per-master residual adapter (train.py)
     use_per_master_adapter: bool = False
@@ -54,43 +66,39 @@ class ModelSpec:
     # which variants a run trains (see RUN_* above)
     run_mode: str = RUN_NO_CAL_THEN_CAL
 
-    # Skip refiner for the two switchable modules: "transformer" | "mamba" | "conv".
-    skip_refiner: str | None = None
-
     def load(self) -> ModuleType:
         return importlib.import_module(f"{__name__}.{self.module}")
 
 
-# use_per_master_adapter records what the source project ran, not what it could run.
+# use_per_master_adapter marks the keys whose runs fine-tune the per-master adapter.
 _SPECS = (
     ModelSpec(
         key="unet_cal_mamba",
-        module="unet_cal_mamba",
-        summary="Calibration U-Net, Mamba attention gate on skips (host project).",
-        source_project="bp_monitor-main_cal_7_5_10 kfold",
+        module=CAL,
+        summary="Calibration U-Net, Mamba attention gate on skips.",
+        module_config={"SKIP_REFINER": "mamba"},
         run_mode=RUN_CALIBRATED_ONLY,
     ),
     ModelSpec(
         key="unet_cal",
-        module="unet_cal",
-        summary="Calibration U-Net, no Mamba / no Transformer (conv skip refiner).",
-        source_project="bp_monitor-main_cal_7_10_1 cal nomambatransformer_kfold",
+        module=CAL,
+        summary="Calibration U-Net with plain skips: no attention gate, no Mamba / Transformer.",
+        # Gate off: plain skips; SKIP_REFINER is then unused.
+        module_config={"SKIP_REFINER": "conv", "USE_SKIP_ATTENTION_GATE": False},
         run_mode=RUN_CALIBRATED_ONLY,
-        skip_refiner="conv",
     ),
     ModelSpec(
         key="unet_cal_transformer",
-        module="unet_cal_transformer",
+        module=CAL,
         summary="Calibration U-Net with Transformer-refined skips.",
-        source_project="bp_monitor-main_cal_7_10_kfold＿2",
+        module_config={"SKIP_REFINER": "transformer"},
         run_mode=RUN_CALIBRATED_ONLY,
-        skip_refiner="transformer",
     ),
     ModelSpec(
         key="unet_cal_abp_ft",
-        module="unet_cal_abp_ft",
+        module=CAL,
         summary="Calibration U-Net + per-master adapter fine-tuned on the ABP waveform.",
-        source_project="bp_monitor-main_cal_7_5_10_1 公平比較＿kfold_2",
+        module_config={"SKIP_REFINER": "mamba"},
         run_mode=RUN_CALIBRATED_ONLY,
         use_per_master_adapter=True,
         adapter_ft_objective=FT_ABP_WAVE,
@@ -98,9 +106,9 @@ _SPECS = (
     ),
     ModelSpec(
         key="unet_cal_bp_ft",
-        module="unet_cal_bp_ft",
+        module=CAL,
         summary="Same architecture as unet_cal_abp_ft; adapter fine-tuned on scalar SBP/DBP.",
-        source_project="bp_monitor-main_cal_7_5_10_2_fair_kfold",
+        module_config={"SKIP_REFINER": "mamba"},
         run_mode=RUN_CALIBRATED_ONLY,
         use_per_master_adapter=True,
         adapter_ft_objective=FT_BP_SCALAR,
@@ -109,36 +117,38 @@ _SPECS = (
     ),
     ModelSpec(
         key="unet_mamba_skip",
-        module="unet_mamba_skip",
+        module=NOCAL_SKIP,
         summary="Mamba skip-refiner U-Net; no-cal Mamba ablation.",
-        source_project="bp_monitor-main_cal_7_5_10_3_fair_2_2_2_kfold_2",
+        module_config={"SKIP_REFINER_INIT_ALPHA_BIAS": -4.0},
+        gate_learning_rate=6e-5,
         run_mode=RUN_NO_CAL_ABLATION,
         use_per_master_adapter=False,
         no_cal_baselines=("mamba",),
     ),
     ModelSpec(
         key="unet_mamba_decoder",
-        module="unet_mamba_decoder",
+        module=NOCAL_DECODER,
         summary="Mamba decoder-refiner U-Net; no-cal Mamba ablation.",
-        source_project="bp_monitor-main_cal_7_5_10_3_fair_2_2_2T2_1_公平kfold2",
+        gate_learning_rate=6e-5,
         run_mode=RUN_NO_CAL_ABLATION,
         use_per_master_adapter=False,
         no_cal_baselines=("mamba",),
     ),
     ModelSpec(
         key="unet_transformer_skip",
-        module="unet_transformer_skip",
+        module=NOCAL_SKIP,
         summary="Transformer skip-refiner U-Net; no-cal Transformer ablation.",
-        source_project="bp_monitor-main_cal_7_6_1 Transformer＿公平kfold_2",
+        module_config={"SKIP_REFINER_INIT_ALPHA_BIAS": -3.0},
+        gate_learning_rate=1e-4,
         run_mode=RUN_NO_CAL_ABLATION,
         use_per_master_adapter=False,
         no_cal_baselines=("transformer",),
     ),
     ModelSpec(
         key="unet_transformer_decoder",
-        module="unet_transformer_decoder",
+        module=NOCAL_DECODER,
         summary="Transformer decoder-refiner U-Net; no-cal Transformer ablation.",
-        source_project="bp_monitor-main_cal_7_6_3 Transformer 3_kfold_2 跑完",
+        gate_learning_rate=6e-5,
         run_mode=RUN_NO_CAL_ABLATION,
         use_per_master_adapter=False,
         no_cal_baselines=("transformer",),
@@ -146,9 +156,8 @@ _SPECS = (
     # The shared no-calibration baseline, trained once and reused.
     ModelSpec(
         key="unet_plain_nocal",
-        module="unet_cal_mamba",
+        module=CAL,
         summary="Plain U-Net, no calibration and no Mamba/Transformer refiner (baseline).",
-        source_project="bp_monitor-main_cal_7_5_10 kfold",
         run_mode=RUN_NO_CAL_ONLY,
     ),
 )
@@ -180,7 +189,10 @@ def load(key: str | None = None) -> ModuleType:
 
 def describe(key: str | None = None) -> str:
     s = get_spec(key)
-    bits = [f"model={s.key}", s.summary]
+    bits = [f"model={s.key}", f"module={s.module}", s.summary]
+    bits += [f"{name}={value}" for name, value in s.module_config.items()]
+    if s.gate_learning_rate is not None:
+        bits.append(f"gate_lr={s.gate_learning_rate}")
     if s.use_per_master_adapter:
         bits.append(f"adapter_ft={s.adapter_ft_objective}")
     if s.no_cal_baselines:
@@ -211,8 +223,22 @@ def _resolved() -> tuple[ModelSpec, ModuleType]:
     global _RESOLVED
     if _RESOLVED is None:
         spec = REGISTRY[_selected_key()]
-        _RESOLVED = (spec, spec.load())
+        module = spec.load()
+        for name, value in spec.module_config.items():
+            setattr(module, name, value)
+        _RESOLVED = (spec, module)
     return _RESOLVED
+
+
+# train.py pushes FS / DROPOUT_P / BASE_CHANNELS / USE_MULTITASK_SBP_DBP here. The classes read
+# them as module globals, so every loaded models.* module gets them. Signature defaults such as
+# dropout=DROPOUT_P are bound at import and keep the module's own value.
+def configure(**values: Any) -> None:
+    _resolved()
+    for name, module in list(sys.modules.items()):
+        if module is not None and name.startswith(f"{__name__}."):
+            for attr, value in values.items():
+                setattr(module, attr, value)
 
 
 def __getattr__(name: str) -> Any:

@@ -1,9 +1,8 @@
-import os, glob, json, shutil, re
+import os, json, shutil, re
 import gzip
 import sys
 import logging
 import random
-import hashlib
 import math
 import subprocess
 from datetime import datetime
@@ -12,20 +11,16 @@ from datetime import datetime
 if __name__ == "__main__":
     sys.modules["train"] = sys.modules[__name__]
 from copy import deepcopy
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Optional
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-from scipy.signal import butter, filtfilt, find_peaks
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-
-import joblib
 
 import models as model_lib
 
@@ -36,10 +31,23 @@ MODEL = "unet_cal_mamba"
 
 model_lib.select(MODEL)
 
-from models import CalibrationUNet, PlainUNet3LNoCal, WaveformLoss
+# Model classes are read off model_lib where built (see _VARIANT_MODELS); only the loss is imported.
+from models import WaveformLoss
 from models import FT_ABP_WAVE, FT_BP_SCALAR
 
+import preprocess
+# Functions may be imported by name. The manifest and the ABP stats change during a run, so
+# they are always read through the module: preprocess.manifest(), preprocess.GLOBAL_ABP_MIN.
+from preprocess import (
+    load_segment, normalize_ppg_ecg_segment, normalize_abp, denormalize_abp,
+    bp_targets_from_wave, get_sid_from_path, get_record_window_index, get_master_record,
+    attach_record_and_subject_indices, install_manifest, save_split_json,
+    build_lists_from_manifest, compute_subject_bp_stats_from_manifest,
+    stratified_subject_kfold, make_kfold_split, compute_global_abp_stats, save_abp_stats,
+)
 
+
+# Data sources and the processed-segment cache
 data_paths = [
     "/media/chen/disk2/Seg3min_Time",
     "/media/chen/disk2/Seg3min2_Time",
@@ -48,13 +56,11 @@ data_paths = [
 processed_dir = "/home/chen/Desktop/processed_minmax_Time_V3"
 os.makedirs(processed_dir, exist_ok=True)
 
-REUSE_PROCESSED = True
-SPLIT_MODE = "subject"            
-DATALOADER_WORKERS = min(8, (os.cpu_count() or 8))
-PIN_MEMORY = True
-PERSISTENT_WORKERS = True
-
-USE_COMPILE = True
+# True deletes the NPZ cache and rebuilds it from CSV. Otherwise existing NPZ are always reused
+# (only the manifest is refreshed) and an empty cache is built without deleting anything.
+FORCE_REBUILD_PROCESSED = False
+NPZ_COMPRESS = False
+WORKERS = max(1, min(32, (os.cpu_count() or 8) - 1))   # CSV -> NPZ process pool
 
 SUBJECT_FILE_MAP_PATHS = [
     "/media/chen/disk2/Seg3min_Time/subject_file_map.csv",
@@ -63,48 +69,56 @@ SUBJECT_FILE_MAP_PATHS = [
 SUBJECT_FILE_MAP_OUTPUT_PATH = os.path.join(processed_dir, "subject_file_map_result.csv")
 
 data_usage_ratio = 1.0
-train_ratio, val_ratio, test_ratio = 0.7, 0.1, 0.2
 DATA_SAMPLE_RATIO = 1.0
 DATA_SAMPLE_SEED = 42
+
+# Subject-wise split: k-fold (default), or one 70/10/20 split when USE_KFOLD = False.
+train_ratio, val_ratio, test_ratio = 0.7, 0.1, 0.2
 
 # Subject-wise folds, so no subject spans train and test.
 USE_KFOLD = True
 KFOLD_N_SPLITS = 5
-KFOLD_VAL_RATIO = 0.125            
+KFOLD_VAL_RATIO = 0.125
 KFOLD_SEED = 42
 KFOLD_STRATIFY_KEY = "sbp"
 KFOLD_STRATIFY_MAX_WINDOWS = 40
 
-# USE_KFOLD_BUNDLE = 1 reads the fold definition from a bundle instead of computing it.
-USE_KFOLD_BUNDLE = 0
+# 1: folds, train/val/test lists, calibration pairs and ABP stats come from the shared bundle.
+# 0: recompute the folds from the manifest.
+USE_KFOLD_BUNDLE = 1
 KFOLD_BUNDLE_DIR = "../kfold_N100_shared_bundle"
 KFOLD_NPZ_ROOT = processed_dir
 KFOLD_BUNDLE_FOLDS = (0, 1, 2, 3, 4)
 KFOLD_BUNDLE_NPZ_CHECK = 5
 
+# Optuna LR search
 USE_OPTUNA_LR_SEARCH = 0
 OPTUNA_LR_GRID = [1e-5, 2e-5, 5e-5, 1e-4, 2e-4, 5e-4, 1e-3, 2e-3, 5e-3, 1e-2]
-OPTUNA_EPOCHS = 5          
+OPTUNA_EPOCHS = 5
 OPTUNA_FOLD = 0            # which fold the search runs on when OPTUNA_PER_FOLD = 0
 OPTUNA_PER_FOLD = 1        # 1 -> every fold searches its own lr
 OPTUNA_THEN_KFOLD = 1      # 1 -> continue into the full k-fold run
+# Models with a gate learning rate search (lr, gate_lr) jointly with TPE instead of the lr grid.
+OPTUNA_N_TRIALS = 10
+OPTUNA_LR_RANGE = (1e-6, 1e-3)        # log-uniform
+OPTUNA_GATE_LR_RANGE = (1e-6, 3e-3)   # log-uniform
+OPTUNA_SEED = 42
 
+# Segments and training loop
 SEGMENT_LEN, STEP_SIZE = 1024, 1024
-batch_size, epochs, learning_rate = 256, 30, 2e-5
 APPLY_FILTERING, FS = True, 125
+batch_size, epochs, learning_rate = 256, 30, 2e-5
+DATALOADER_WORKERS = min(8, (os.cpu_count() or 8))
+PIN_MEMORY = True
+PERSISTENT_WORKERS = True
+USE_COMPILE = True
+GLOBAL_SEED = 42
+SEED_DETERMINISTIC = 0
 
-WORKERS = max(1, min(32, (os.cpu_count() or 8) - 1))
-
-train_list, val_list, test_list = [], [], []
-
-GLOBAL_ABP_MIN = None
-GLOBAL_ABP_MAX = None
-NPZ_COMPRESS = False
-
+# Model
 DROPOUT_P = 0.2
 BASE_CHANNELS = 128
-
-REGRESSION_TARGETS = ("sbp", "dbp")
+USE_SIGNAL_STATS = True
 
 USE_MULTITASK_SBP_DBP = True
 MT_SBP_LOSS_WEIGHT = 0.1
@@ -116,6 +130,23 @@ BOTTLENECK_RIDGE_USE_TRAIN_VAL = True
 MODEL_SPEC = model_lib.get_spec()
 MODEL_NAME = MODEL_SPEC.key
 
+# The refiner families train decoder.ag* (skip gates / in-decoder refiners) at their own
+# learning rate; None = everything at learning_rate.
+GATE_LEARNING_RATE = MODEL_SPEC.gate_learning_rate
+
+# Deep-skip gate of the skip-refiner family (unet_mamba_skip / unet_transformer_skip):
+# 0 = Transformer, 1 = Conformer.
+USE_CONFORMER_GATE = 0
+
+_MODULE_HAS_GATE_SWITCH = hasattr(model_lib, "USE_CONFORMER_GATE")
+_GATE_KWARGS = ({"use_conformer_gate": int(USE_CONFORMER_GATE)}
+                if _MODULE_HAS_GATE_SWITCH else {})
+
+# Sync model module configuration
+model_lib.configure(FS=FS, DROPOUT_P=DROPOUT_P, BASE_CHANNELS=BASE_CHANNELS,
+                    USE_MULTITASK_SBP_DBP=USE_MULTITASK_SBP_DBP)
+
+# Per-master residual adapter: objective and weights come from the spec, the schedule is here.
 USE_PER_MASTER_ADAPTER = bool(MODEL_SPEC.use_per_master_adapter)
 ADAPTER_FT_OBJECTIVE = MODEL_SPEC.adapter_ft_objective
 ADAPTER_FINETUNE_WEIGHT_DECAY = float(MODEL_SPEC.adapter_finetune_weight_decay)
@@ -134,24 +165,11 @@ ADAPTER_VAL_FRAC = 0.2
 ADAPTER_EARLY_STOP_PATIENCE = 5
 ADAPTERS_BASENAME = "per_master_adapters.pt"
 
-NO_CAL_BASELINES = tuple(MODEL_SPEC.no_cal_baselines)
-
-# unet_transformer_skip deep-skip gate: 0 = Transformer, 1 = Conformer.
-USE_CONFORMER_GATE = 0
-
-# Gates read their module's SKIP_REFINER at construction, so set it before use.
-SKIP_REFINER = MODEL_SPEC.skip_refiner
-if SKIP_REFINER is not None:
-    setattr(model_lib.load(), "SKIP_REFINER", SKIP_REFINER)
-
-_MODULE_HAS_GATE_SWITCH = hasattr(model_lib, "USE_CONFORMER_GATE")
-_GATE_KWARGS = ({"use_conformer_gate": int(USE_CONFORMER_GATE)}
-                if _MODULE_HAS_GATE_SWITCH else {})
-
 # Only the adapter models expose ResidualFeatureAdapter1D, so import it lazily.
 if USE_PER_MASTER_ADAPTER:
     ResidualFeatureAdapter1D = model_lib.ResidualFeatureAdapter1D
 
+# Calibration windows
 CALIBRATION_WINDOW_COUNT = 100
 
 N_VALUES = (100,)
@@ -161,6 +179,9 @@ CALIBRATION_POOL_JUST_BEFORE_FIRST_TARGET = True
 
 CALIBRATION_MAX_GAP_MINUTES = 1440.0
 
+# Variants a run trains, and their checkpoint files
+NO_CAL_BASELINES = tuple(MODEL_SPEC.no_cal_baselines)
+
 # Empty = the selected model's own run mode.
 RUN_MODE_OVERRIDE = ""
 RUN_MODE = RUN_MODE_OVERRIDE or MODEL_SPEC.run_mode
@@ -169,25 +190,18 @@ if RUN_MODE not in model_lib.RUN_MODES:
         f"Unknown RUN_MODE {RUN_MODE!r}. Valid: {', '.join(model_lib.RUN_MODES)}"
     )
 
-# Every variant reuses the same filtered target list; no-cal models ignore the cal inputs.
+VARIANT_CALIBRATED = "calibrated"
+VARIANT_NO_CALIBRATION = "no_calibration"
+VARIANT_NO_CAL_UNET_MAMBA = "no_cal_unet_mamba"           # Mamba d_state=8
+VARIANT_NO_CAL_UNET_TRANSFORMER = "no_cal_unet_transformer"
 
 CHECKPOINT_BASENAME_CAL = "best_calibration_unet.pth"
 CHECKPOINT_BASENAME_NO_CAL = "best_plain_unet_nocal.pth"
-
-VARIANT_CALIBRATED = "calibrated"
-VARIANT_NO_CALIBRATION = "no_calibration"
-
-VARIANT_NO_CAL_UNET_MAMBA = "no_cal_unet_mamba"           # Mamba d_state=8
-VARIANT_NO_CAL_UNET_MAMBA_D16 = "no_cal_unet_mamba_d16"   # Mamba d_state=16
-VARIANT_NO_CAL_UNET_TRANSFORMER = "no_cal_unet_transformer"
-
 CHECKPOINT_BASENAME_NO_CAL_MAMBA = "best_no_cal_unet_mamba.pth"
-CHECKPOINT_BASENAME_NO_CAL_MAMBA_D16 = "best_no_cal_unet_mamba_d16.pth"
 CHECKPOINT_BASENAME_NO_CAL_TRANSFORMER = "best_no_cal_unet_transformer.pth"
 
 _NO_CAL_BASELINE_VARIANTS = {
     "mamba": VARIANT_NO_CAL_UNET_MAMBA,
-    "mamba_d16": VARIANT_NO_CAL_UNET_MAMBA_D16,
     "transformer": VARIANT_NO_CAL_UNET_TRANSFORMER,
 }
 
@@ -198,36 +212,27 @@ TEST_ONLY_VISUALIZE = True
 TEST_ONLY_RUN_RIDGE = True
 TEST_ONLY_PLOT_TRUEPRED_SCATTER = True
 
+# Run directories and plots
 RUN_DIR: str = ""
 RUN_ROOT = "runs"
-RUN_DIR_PREFIX = "calibration_"
 RUN_DIR_TS_FMT = "%Y%m%d-%H%M%S"
 
-# Backwards-compat: kept so code paths that read CHECKPOINT_BASENAME still resolve.
-CHECKPOINT_BASENAME = CHECKPOINT_BASENAME_CAL
-
-GLOBAL_SEED = 42
-SEED_DETERMINISTIC = 0
-
-USE_SIGNAL_STATS = True
-
-ENABLE_PLOT_PRETRAIN_DISTRIBUTIONS = False
 ENABLE_PLOT_BA_SCATTER = True
 ENABLE_PLOT_TRUEPRED_SCATTER = True
-
 PLOT_TIMESTAMP_FMT = "%Y%m%d-%H%M%S"
 
-# Sync model module configuration
-model_lib.FS = FS
-model_lib.DROPOUT_P = DROPOUT_P
-model_lib.BASE_CHANNELS = BASE_CHANNELS
-model_lib.USE_MULTITASK_SBP_DBP = USE_MULTITASK_SBP_DBP
+# Hand the data-format and path settings to the preprocessing module.
+preprocess.configure(
+    fs=FS, segment_len=SEGMENT_LEN, step_size=STEP_SIZE, apply_filtering=APPLY_FILTERING,
+    processed_dir=processed_dir, npz_compress=NPZ_COMPRESS, data_paths=data_paths,
+    subject_file_map_paths=SUBJECT_FILE_MAP_PATHS, workers=WORKERS,
+    data_sample_ratio=DATA_SAMPLE_RATIO, data_sample_seed=DATA_SAMPLE_SEED,
+)
 
-# Runtime caches. target_npz_path -> cal pair dict.
+# Runtime state filled in during a run. The manifest and the ABP stats live in preprocess.
+train_list, val_list, test_list = [], [], []
+# target_npz_path -> cal pair dict.
 _WINDOW_CAL_PAIRS: dict = {}
-# pandas DataFrame; columns: npz_path, sid, source_csv, master_record, local_window_index_in_csv.
-_PROCESSED_MANIFEST: Optional[pd.DataFrame] = None
-_PATH_TO_META: dict = {}
 
 
 # Logging and plot output
@@ -324,1085 +329,16 @@ def _seed_worker(worker_id: int):
         pass
 
 
-# Signal filtering, normalization, alignment
-def normalize_abp(abp):
-    return (abp - GLOBAL_ABP_MIN) / (GLOBAL_ABP_MAX - GLOBAL_ABP_MIN)
-
-
-def denormalize_abp(abp_norm):
-    return abp_norm * (GLOBAL_ABP_MAX - GLOBAL_ABP_MIN) + GLOBAL_ABP_MIN
-
-
-def create_bandpass_filter(lowcut=0.5, highcut=8.0, fs=FS, order=4):
-    nyq = 0.5 * fs
-    b, a = butter(order, [lowcut / nyq, highcut / nyq], btype="band")
-    return b, a
-
-
-b_bp, a_bp = create_bandpass_filter()
-
-
-def hampel_filter(ppg, window_size=7, n_std=3):
-    df = pd.DataFrame(ppg, columns=["ppg"])
-    med = df["ppg"].rolling(window_size, center=True, min_periods=1).median()
-    std = df["ppg"].rolling(window_size, center=True, min_periods=1).std()
-    diff = np.abs(df["ppg"] - med)
-    df.loc[diff > n_std * std, "ppg"] = med
-    return df["ppg"].values
-
-
-def cross_correlation_align(ABP, PPG, ECG, dPPG, max_lag_sec=0.6,
-                            raw_idx=None, master_idx=None):
-    length = min(len(ABP), len(PPG), len(ECG), len(dPPG))
-    if length < 2:
-        return ABP, PPG, ECG, dPPG, raw_idx, master_idx
-    ABP_, PPG_ = ABP[:length].astype(np.float32), PPG[:length].astype(np.float32)
-    ECG_, dPPG_ = ECG[:length].astype(np.float32), dPPG[:length].astype(np.float32)
-    raw_ = raw_idx[:length] if raw_idx is not None else None
-    master_ = master_idx[:length] if master_idx is not None else None
-
-    max_lag = int(max(1, round(max_lag_sec * FS)))
-    abp_c = ABP_ - ABP_.mean()
-    ppg_c = PPG_ - PPG_.mean()
-    abp_std = np.std(abp_c) + 1e-6
-    ppg_std = np.std(ppg_c) + 1e-6
-
-    best_lag, best_score = 0, -1e9
-    for lag in range(-max_lag, max_lag + 1):
-        if lag >= 0:
-            a = abp_c[lag:]
-            p = ppg_c[:len(a)]
-        else:
-            p = ppg_c[-lag:]
-            a = abp_c[:len(p)]
-        if len(a) < 8:
-            continue
-        score = float(np.dot(a, p) / (len(a) * abp_std * ppg_std))
-        if score > best_score:
-            best_score, best_lag = score, lag
-
-    if best_lag > 0:
-        # Search used a = abp_c[lag:], p = ppg_c[:len(a)]: drop first best_lag samples of ABP.
-        ABP_ = ABP_[best_lag:]
-        L_a = len(ABP_)
-        PPG_, ECG_, dPPG_ = PPG_[:L_a], ECG_[:L_a], dPPG_[:L_a]
-        if raw_ is not None:
-            raw_ = raw_[best_lag:best_lag + L_a]
-        if master_ is not None:
-            master_ = master_[best_lag:best_lag + L_a]
-    elif best_lag < 0:
-        # Search used p = ppg_c[-lag:], a = abp_c[:len(p)]: drop first -best_lag samples of PPG/ECG/dPPG.
-        s = -best_lag
-        PPG_, ECG_, dPPG_ = PPG_[s:], ECG_[s:], dPPG_[s:]
-        L_a = len(PPG_)
-        ABP_ = ABP_[:L_a]
-        if raw_ is not None:
-            raw_ = raw_[:L_a]
-        if master_ is not None:
-            master_ = master_[:L_a]
-
-    L = min(len(ABP_), len(PPG_), len(ECG_), len(dPPG_))
-    ABP_, PPG_, ECG_, dPPG_ = ABP_[:L], PPG_[:L], ECG_[:L], dPPG_[:L]
-    if raw_ is not None:
-        raw_ = raw_[:L]
-    if master_ is not None:
-        master_ = master_[:L]
-    return ABP_, PPG_, ECG_, dPPG_, raw_, master_
-
-
-# subject_file_map I/O
-def read_subject_file_map(map_csv_path):
-    if not os.path.isfile(map_csv_path):
-        raise FileNotFoundError(f"subject_file_map file not found: {map_csv_path}")
-    df = pd.read_csv(map_csv_path)
-    if "subject_id" not in df.columns:
-        raise ValueError("subject_file_map missing column: subject_id")
-    if ("input_file" not in df.columns) and ("output_csv" not in df.columns):
-        raise ValueError("subject_file_map requires at least one column: input_file or output_csv")
-
-    base_dirs = [os.path.dirname(os.path.abspath(map_csv_path))]
-    for d in (data_paths if isinstance(data_paths, (list, tuple)) else []):
-        if isinstance(d, str):
-            base_dirs.append(d)
-    base_dirs = list(dict.fromkeys(base_dirs))
-
-    def resolve_path(name):
-        if isinstance(name, str) and os.path.isabs(name) and os.path.isfile(name):
-            return os.path.abspath(name)
-        if isinstance(name, str):
-            for b in base_dirs:
-                cand = os.path.abspath(os.path.join(b, name))
-                if os.path.isfile(cand):
-                    return cand
-        return None
-
-    rows = []
-    for _, r in df.iterrows():
-        sid = str(r.get("subject_id", "")).strip()
-        if not sid or sid.lower() == "unknown":
-            continue
-        inp = str(r.get("input_file", "")).strip() if "input_file" in df.columns else ""
-        out = str(r.get("output_csv", "")).strip() if "output_csv" in df.columns else ""
-
-        csv_name = out if out else (os.path.splitext(inp)[0] + ".csv" if inp else "")
-        if not csv_name:
-            continue
-
-        csv_path = resolve_path(csv_name)
-        if csv_path is None and inp:
-            csv_path = resolve_path(os.path.splitext(inp)[0] + ".csv")
-
-        if csv_path is None:
-            continue
-        if not out:
-            out = os.path.basename(csv_path)
-
-        rows.append({
-            "subject_id": sid,
-            "input_file": inp,
-            "output_csv": out,
-            "csv_path": csv_path,
-        })
-
-    if not rows:
-        raise RuntimeError(
-            "No valid CSV paths parsed in subject_file_map.csv; check output_csv/filename and "
-            f"directories: {base_dirs}"
-        )
-
-    used_df = pd.DataFrame(rows, columns=["subject_id", "input_file", "output_csv", "csv_path"]).drop_duplicates("csv_path")
-    # Sort for deterministic downstream processing
-    used_df = used_df.sort_values("csv_path").reset_index(drop=True)
-    mapping = dict(zip(used_df["csv_path"], used_df["subject_id"]))
-    return mapping, used_df
-
-
-def read_subject_file_maps(map_csv_paths):
-    rows = []
-    merged_mapping = {}
-    used_list = []
-    for p in map_csv_paths:
-        try:
-            mp_map, mp_df = read_subject_file_map(p)
-            for k, v in mp_map.items():
-                if k in merged_mapping and merged_mapping[k] != v:
-                    logging.warning(f"Mapping conflict: {k} -> {merged_mapping[k]} vs {v}, keeping previous value")
-                    continue
-                merged_mapping[k] = v
-            used_list.append(mp_df)
-        except Exception as e:
-            logging.warning(f"Failed to read {p}: {e}")
-    if not merged_mapping:
-        raise RuntimeError("No valid records read from any subject_file_map")
-    used_df = pd.concat(used_list, axis=0, ignore_index=True).drop_duplicates("csv_path")
-    used_df = used_df.sort_values("csv_path").reset_index(drop=True)
-    return merged_mapping, used_df
-
-
-def _read_master_record_lookup(map_csv_paths):
-    lookup = {}
-    for p in map_csv_paths or []:
-        try:
-            if not p or not os.path.isfile(p):
-                continue
-            df = pd.read_csv(p)
-            if "subject_id" not in df.columns or "master_record" not in df.columns:
-                continue
-            csv_col = "output_csv" if "output_csv" in df.columns else (
-                "input_file" if "input_file" in df.columns else None)
-            if csv_col is None:
-                continue
-            for _, r in df.iterrows():
-                sid = str(r.get("subject_id", "")).strip()
-                csv_name = str(r.get(csv_col, "")).strip()
-                master = str(r.get("master_record", "")).strip()
-                if not sid or not csv_name or not master or master.lower() == "nan":
-                    continue
-                if csv_col == "input_file":
-                    csv_name = os.path.splitext(csv_name)[0] + ".csv"
-                csv_name = os.path.basename(csv_name)
-                key = (sid, csv_name)
-                if key in lookup and lookup[key] != master:
-                    logging.warning(
-                        f"master_record conflict for {key}: "
-                        f"{lookup[key]} vs {master}, keeping previous"
-                    )
-                    continue
-                lookup[key] = master
-        except Exception as e:
-            logging.warning(f"Failed to read master_record from {p}: {e}")
-    return lookup
-
-
-# Per-subject BP stats and stratified split
-def _csv_avg_bp(csv_path):
-    try:
-        abp = pd.read_csv(csv_path, usecols=["ABP"], dtype=np.float32,
-                          engine="c", memory_map=True).values.squeeze()
-        abp = abp[np.isfinite(abp)]
-        if len(abp) < 200:
-            return (np.nan, np.nan)
-        abp_s = np.convolve(abp, np.ones(5)/5, mode="same")
-        dist = int(0.32 * FS)
-        sys_idx, _ = find_peaks(abp_s, distance=dist)
-        dia_idx, _ = find_peaks(-abp_s, distance=dist)
-        if len(sys_idx) < 3 or len(dia_idx) < 3:
-            return (np.nan, np.nan)
-        return (float(np.mean(abp[sys_idx])), float(np.mean(abp[dia_idx])))
-    except Exception:
-        return (np.nan, np.nan)
-
-
-def compute_subject_bp_stats(csv_files, file2subj):
-    subj_sbp, subj_dbp, subj_cnt = {}, {}, {}
-    with ProcessPoolExecutor(max_workers=WORKERS) as exe:
-        results = list(exe.map(_csv_avg_bp, csv_files))
-        for csv_path, result in tqdm(zip(csv_files, results), total=len(csv_files),
-                desc="Phase-A: compute subject BP stats"):
-            sbp_m, dbp_m = result
-            if not np.isfinite(sbp_m):
-                continue
-            subj = file2subj[csv_path]
-            subj_sbp[subj] = subj_sbp.get(subj, 0.0) + sbp_m
-            subj_dbp[subj] = subj_dbp.get(subj, 0.0) + dbp_m
-            subj_cnt[subj] = subj_cnt.get(subj, 0) + 1
-    stats = {}
-    for s, c in subj_cnt.items():
-        stats[s] = (subj_sbp[s] / c, subj_dbp[s] / c)
-    return stats
-
-
-def stratified_snake_split(subj_stats, train_ratio=0.7, val_ratio=0.1, test_ratio=0.2, sort_key="sbp"):
-    subjects = sorted(subj_stats.keys())  # deterministic input order
-    n = len(subjects)
-    if n == 0:
-        return set(), set(), set()
-    ratios = np.array([max(0.0, float(train_ratio)), max(0.0, float(val_ratio)), max(0.0, float(test_ratio))], dtype=np.float64)
-    s = ratios.sum()
-    if s <= 0:
-        ratios = np.array([1.0, 0.0, 0.0], dtype=np.float64)
-    else:
-        ratios /= s
-    n_train = int(np.floor(n * ratios[0]))
-    n_val   = int(np.floor(n * ratios[1]))
-    n_test  = max(0, n - n_train - n_val)
-    quotas = np.array([n_train, n_val, n_test], dtype=np.int64)
-
-    def key_fn(sid):
-        sbp, dbp = subj_stats.get(sid, (np.nan, np.nan))
-        if sort_key == "dbp":
-            return dbp if np.isfinite(dbp) else np.inf
-        elif sort_key == "mean":
-            m = (sbp + dbp) / 2.0 if (np.isfinite(sbp) and np.isfinite(dbp)) else np.nan
-            return m if np.isfinite(m) else np.inf
-        else:
-            return sbp if np.isfinite(sbp) else np.inf
-
-    valid = [sid for sid in subjects if np.isfinite(key_fn(sid))]
-    invalid = [sid for sid in subjects if not np.isfinite(key_fn(sid))]
-    valid.sort(key=lambda x: (key_fn(x), x))
-    invalid.sort()
-    ordered = valid + invalid
-
-    credits = np.zeros(3, dtype=np.float64)
-    bins = [[], [], []]
-    for sid in ordered:
-        for _ in range(3):
-            credits += ratios
-            masked = credits.copy()
-            for i in range(3):
-                if quotas[i] <= 0:
-                    masked[i] = -1e18
-            idx = int(np.argmax(masked))
-            if quotas[idx] > 0:
-                bins[idx].append(sid)
-                quotas[idx] -= 1
-                credits[idx] -= 1.0
-                break
-        else:
-            idx = int(np.argmax([len(b) for b in bins]))
-            bins[idx].append(sid)
-    return set(bins[0]), set(bins[1]), set(bins[2])
-
-
-# CSV reading + NPZ creation with metadata
-_REQUIRED_CSV_COLS = ["PLETH", "II", "dPPG", "ABP"]
-_OPTIONAL_CSV_COLS = ["raw_sample_idx", "master_record_raw_sample_idx"]
-
-
-# CSV -> NPZ conversion
-def read_and_align_csv(fp):
-    has_raw_warn_msg = ""
-    try:
-        # Detect available columns first (cheap header read)
-        header = pd.read_csv(fp, nrows=0)
-        avail = set(header.columns)
-        has_raw = "raw_sample_idx" in avail
-        has_master = "master_record_raw_sample_idx" in avail
-        usecols = list(_REQUIRED_CSV_COLS) + [c for c in _OPTIONAL_CSV_COLS if c in avail]
-        dtypes = {c: np.float32 for c in _REQUIRED_CSV_COLS}
-        if has_raw:
-            dtypes["raw_sample_idx"] = np.int64
-        if has_master:
-            dtypes["master_record_raw_sample_idx"] = np.int64
-
-        df = pd.read_csv(fp, usecols=usecols, dtype=dtypes, engine="c",
-                         memory_map=True, low_memory=False)
-        df.dropna(subset=_REQUIRED_CSV_COLS, inplace=True)
-        df = df[(df[_REQUIRED_CSV_COLS] != 0).all(axis=1)]
-        if len(df) < SEGMENT_LEN:
-            return np.array([]), np.array([]), None, None, ""
-
-        ppg = df["PLETH"].values
-        ecg = df["II"].values
-        dppg = df["dPPG"].values
-        abp = df["ABP"].values
-        raw_idx = df["raw_sample_idx"].values.astype(np.int64) if has_raw else None
-        master_idx = df["master_record_raw_sample_idx"].values.astype(np.int64) if has_master else None
-
-        if not has_raw:
-            has_raw_warn_msg = (f"WARN: {os.path.basename(fp)} missing raw_sample_idx; "
-                                f"falling back without time anchor")
-
-        a, p, e, d, r_idx, m_idx = cross_correlation_align(
-            abp, ppg, ecg, dppg, raw_idx=raw_idx, master_idx=master_idx
-        )
-        if len(a) < SEGMENT_LEN:
-            return np.array([]), np.array([]), None, None, has_raw_warn_msg
-
-        X = np.column_stack([p, e, d])  # shape [N,3]
-        Y = a
-        return X, Y, r_idx, m_idx, has_raw_warn_msg
-    except Exception as err:
-        logging.error(f"Failed to read {os.path.basename(fp)}: {err}")
-        return np.array([]), np.array([]), None, None, ""
-
-
-def chunk_data_with_index(X, Y, raw_idx, master_idx,
-                          seg_len=SEGMENT_LEN, step=STEP_SIZE):
-    N = len(Y)
-    for i in range(0, N - seg_len + 1, step):
-        seg_X = X[i:i + seg_len]
-        seg_Y = Y[i:i + seg_len]
-        if not np.isfinite(seg_X).all() or not np.isfinite(seg_Y).all():
-            continue
-        if np.std(seg_X[:, 0]) <= 0.01:
-            continue
-        end_pos = i + seg_len - 1
-        raw_s = int(raw_idx[i]) if raw_idx is not None else None
-        raw_e = int(raw_idx[end_pos]) if raw_idx is not None else None
-        m_s = int(master_idx[i]) if master_idx is not None else None
-        m_e = int(master_idx[end_pos]) if master_idx is not None else None
-        yield seg_X, seg_Y, i, end_pos, raw_s, raw_e, m_s, m_e
-
-
-def _short_hash(s: str) -> str:
-    try:
-        return hashlib.blake2b(s.encode("utf-8"), digest_size=4).hexdigest()
-    except Exception:
-        return hex(abs(hash(s)) & 0xFFFFFFFF)[2:]
-
-
-def process_single_csv(args):
-    csv_path, subj_id = args
-    out_paths = []
-    X_all, Y_all, raw_idx_all, master_idx_all, raw_warn = read_and_align_csv(csv_path)
-    if Y_all.size == 0:
-        return out_paths, raw_warn
-
-    source_csv_basename = os.path.basename(csv_path)
-    safe_subj = re.sub(r'[^A-Za-z0-9_\-]+', '_', str(subj_id))
-    h = _short_hash(os.path.abspath(csv_path))
-
-    local_id = 0
-    for seg_X, seg_Y, _, _, raw_s, raw_e, m_s, m_e in chunk_data_with_index(
-            X_all, Y_all, raw_idx_all, master_idx_all):
-        abp = seg_Y
-        mn, mx = float(abp.min()), float(abp.max())
-        if mx - mn < 5.0 or mn < 30 or mx > 250:
-            continue
-        abp_cv = float(np.std(abp) / (np.mean(abp) + 1e-6))
-        if abp_cv < 0.05:
-            continue
-
-        out_p = os.path.join(processed_dir,
-                             f"{safe_subj}_{source_csv_basename[:-4]}_{h}_{local_id}.npz")
-
-        npz_payload = dict(
-            X=seg_X.astype(np.float32),
-            Y=seg_Y.astype(np.float32),
-            abp_min=np.float32(mn),
-            abp_max=np.float32(mx),
-            sid=np.array(str(subj_id)),
-            source_csv=np.array(source_csv_basename),
-            local_window_index_in_csv=np.int64(local_id),
-            subject_window_index=np.int64(-1),  # filled by manifest pass
-            raw_start_idx=np.int64(raw_s) if raw_s is not None else np.int64(-1),
-            raw_end_idx=np.int64(raw_e) if raw_e is not None else np.int64(-1),
-            master_raw_start_idx=np.int64(m_s) if m_s is not None else np.int64(-1),
-            master_raw_end_idx=np.int64(m_e) if m_e is not None else np.int64(-1),
-            window_start_time_sec=(np.float64(raw_s) / FS) if raw_s is not None else np.float64(-1.0),
-            window_end_time_sec=(np.float64(raw_e) / FS) if raw_e is not None else np.float64(-1.0),
-            has_raw_idx=np.int64(1 if raw_s is not None else 0),
-        )
-
-        if NPZ_COMPRESS:
-            np.savez_compressed(out_p, **npz_payload)
-        else:
-            np.savez(out_p, **npz_payload)
-        out_paths.append(out_p)
-        local_id += 1
-
-    return out_paths, raw_warn
-
-
-# Split files and processed manifest
-def save_split_json(train_subj, val_subj, test_subj, path):
-    try:
-        with open(path, "w") as f:
-            json.dump({
-                "train": sorted(list(train_subj)),
-                "val": sorted(list(val_subj)),
-                "test": sorted(list(test_subj)),
-            }, f)
-        logging.info(f"Saved subject splits to: {path}")
-    except Exception as e:
-        logging.warning(f"Failed to save splits: {e}")
-
-
-def load_split_json(path):
-    if not os.path.isfile(path):
-        return None
-    try:
-        with open(path, "r") as f:
-            d = json.load(f)
-        return set(d.get("train", [])), set(d.get("val", [])), set(d.get("test", []))
-    except Exception as e:
-        logging.warning(f"Failed to read splits: {e}")
-        return None
-
-
-def _npz_meta_minimal(npz_path):
-    try:
-        with np.load(npz_path, allow_pickle=False) as d:
-            keys = set(getattr(d, 'files', []))
-            sid = str(d["sid"].item()) if d["sid"].ndim == 0 else str(d["sid"])
-            source_csv = (str(d["source_csv"].item()) if "source_csv" in keys
-                          and d["source_csv"].ndim == 0
-                          else (str(d["source_csv"]) if "source_csv" in keys else ""))
-            local_idx = int(d["local_window_index_in_csv"]) if "local_window_index_in_csv" in keys else -1
-            raw_start = int(d["raw_start_idx"]) if "raw_start_idx" in keys else -1
-            raw_end = int(d["raw_end_idx"]) if "raw_end_idx" in keys else -1
-            m_start = int(d["master_raw_start_idx"]) if "master_raw_start_idx" in keys else -1
-            m_end = int(d["master_raw_end_idx"]) if "master_raw_end_idx" in keys else -1
-        return {
-            "sid": sid,
-            "source_csv": source_csv,
-            "local_window_index_in_csv": local_idx,
-            "raw_start_idx": raw_start,
-            "raw_end_idx": raw_end,
-            "master_raw_start_idx": m_start,
-            "master_raw_end_idx": m_end,
-            "_has_meta": (source_csv != "" and local_idx >= 0),
-        }
-    except Exception as e:
-        logging.warning(f"Failed to read NPZ metadata for {npz_path}: {e}")
-        return None
-
-
-def _attach_master_record_column(df):
-    if df is None or len(df) == 0:
-        return df
-    lookup = _read_master_record_lookup(SUBJECT_FILE_MAP_PATHS)
-    if lookup:
-        master_col = []
-        miss = 0
-        for s, c in zip(df["sid"].astype(str).tolist(),
-                        df["source_csv"].astype(str).tolist()):
-            base = os.path.basename(c)
-            v = lookup.get((s, base))
-            if v is None:
-                miss += 1
-                v = base  # fallback: 1 source_csv = 1 master
-            master_col.append(v)
-        if miss:
-            logging.warning(
-                f"master_record lookup missing for {miss} manifest rows; "
-                f"falling back to source_csv as master_record for those rows."
-            )
-        df = df.copy()
-        df["master_record"] = master_col
-    else:
-        logging.warning(
-            "No master_record column found in subject_file_map.csv; "
-            "treating each source_csv as its own master_record."
-        )
-        df = df.copy()
-        df["master_record"] = df["source_csv"].astype(str).apply(os.path.basename)
-    return df
-
-
-def _attach_record_and_subject_indices(df):
-    if df is None or len(df) == 0:
-        return df
-    if "master_record" not in df.columns:
-        df = _attach_master_record_column(df)
-
-    df = df.copy()
-    if "master_raw_start_idx" not in df.columns:
-        df["master_raw_start_idx"] = -1
-    df["_sort_master"] = df["master_raw_start_idx"].where(
-        df["master_raw_start_idx"] >= 0, other=2**62
-    )
-    df["_sort_raw"] = df["raw_start_idx"].where(df["raw_start_idx"] >= 0,
-                                                other=2**62)
-
-    # record_window_index within (sid, master_record), master-timeline first.
-    df = df.sort_values(
-        by=["sid", "master_record", "_sort_master", "_sort_raw",
-            "source_csv", "local_window_index_in_csv", "npz_path"],
-        kind="mergesort",
-    ).reset_index(drop=True)
-    df["record_window_index"] = (
-        df.groupby(["sid", "master_record"]).cumcount().astype(np.int64)
-    )
-
-    # subject_window_index across all master_records for that subject.
-    df = df.sort_values(
-        by=["sid", "_sort_raw", "master_record", "_sort_master",
-            "source_csv", "local_window_index_in_csv", "npz_path"],
-        kind="mergesort",
-    ).reset_index(drop=True)
-    df["subject_window_index"] = (
-        df.groupby("sid").cumcount().astype(np.int64)
-    )
-
-    df = df.drop(columns=["_sort_master", "_sort_raw"])
-    return df
-
-
-def build_or_update_processed_manifest(npz_files, output_manifest_path):
-    npz_files_sorted = sorted(npz_files)
-    rows = []
-    for fp in tqdm(npz_files_sorted, desc="Manifest: scan NPZ"):
-        meta = _npz_meta_minimal(fp)
-        if meta is None:
-            continue
-        if not meta["_has_meta"]:
-            raise RuntimeError(
-                f"NPZ '{fp}' missing required metadata (source_csv / "
-                f"local_window_index_in_csv). Legacy local_id is NOT a true "
-                f"cumulative record index; per-subject cumulative-prefix "
-                f"calibration requires processed_manifest "
-                f"record_window_index. Set REUSE_PROCESSED=False to "
-                f"rebuild NPZ."
-            )
-        rows.append({
-            "npz_path": fp,
-            "sid": meta["sid"],
-            "source_csv": meta["source_csv"],
-            "local_window_index_in_csv": meta["local_window_index_in_csv"],
-            "raw_start_idx": meta["raw_start_idx"],
-            "raw_end_idx": meta["raw_end_idx"],
-            "master_raw_start_idx": meta["master_raw_start_idx"],
-            "master_raw_end_idx": meta["master_raw_end_idx"],
-        })
-
-    if not rows:
-        raise RuntimeError(f"No NPZ metadata could be read from {len(npz_files)} files")
-
-    df = pd.DataFrame(rows)
-
-    # Attach master_record (from subject_file_map.csv, falling back to source_csv basename).
-    df = _attach_master_record_column(df)
-    df = _attach_record_and_subject_indices(df)
-
-    cols = ["npz_path", "sid", "source_csv", "master_record",
-            "local_window_index_in_csv",
-            "subject_window_index", "record_window_index",
-            "raw_start_idx", "raw_end_idx",
-            "master_raw_start_idx", "master_raw_end_idx"]
-    df = df[cols]
-
-    df.to_csv(output_manifest_path, index=False)
-
-    n_rows = int(len(df))
-    n_subjects = int(df["sid"].nunique())
-    n_masters = int(df.groupby(["sid", "master_record"]).ngroups)
-    sizes = df.groupby(["sid", "master_record"]).size()
-    n_masters_usable = int((sizes >= CALIBRATION_WINDOW_COUNT).sum())
-    logging.info(
-        f"Saved processed manifest: {output_manifest_path} "
-        f"({n_rows} windows, {n_subjects} subjects, {n_masters} master_records; "
-        f"usable with >={CALIBRATION_WINDOW_COUNT} windows: {n_masters_usable})"
-    )
-    return df
-
-
-def load_processed_manifest(manifest_path):
-    if not os.path.isfile(manifest_path):
-        return None
-    df = pd.read_csv(manifest_path)
-    required_cols = {"npz_path", "sid", "source_csv", "local_window_index_in_csv",
-                     "raw_start_idx", "raw_end_idx"}
-    missing = required_cols - set(df.columns)
-    if missing:
-        raise RuntimeError(f"processed_manifest.csv missing columns: {missing}")
-    # Older manifests may lack master_record / record_window_index / subject_window_index.
-    if "master_record" not in df.columns:
-        df["master_record"] = df["source_csv"].astype(str).apply(os.path.basename)
-    if "record_window_index" not in df.columns or "subject_window_index" not in df.columns:
-        df = _attach_record_and_subject_indices(df)
-    return df
-
-
-def install_manifest(df: pd.DataFrame):
-    global _PROCESSED_MANIFEST, _PATH_TO_META
-    _PROCESSED_MANIFEST = df
-    _PATH_TO_META = {}
-    has_master_record = "master_record" in df.columns
-    has_record_idx = "record_window_index" in df.columns
-    has_subject_idx = "subject_window_index" in df.columns
-    for r in df.itertuples(index=False):
-        _PATH_TO_META[r.npz_path] = {
-            "sid": str(r.sid),
-            "source_csv": str(r.source_csv),
-            "master_record": str(getattr(r, "master_record", r.source_csv)) if has_master_record else str(r.source_csv),
-            "local_window_index_in_csv": int(r.local_window_index_in_csv),
-            "subject_window_index": int(getattr(r, "subject_window_index", -1)) if has_subject_idx else -1,
-            "record_window_index": int(getattr(r, "record_window_index", -1)) if has_record_idx else -1,
-            "raw_start_idx": int(r.raw_start_idx),
-            "raw_end_idx": int(r.raw_end_idx),
-            "master_raw_start_idx": int(getattr(r, "master_raw_start_idx", -1)) if hasattr(r, "master_raw_start_idx") else -1,
-            "master_raw_end_idx": int(getattr(r, "master_raw_end_idx", -1)) if hasattr(r, "master_raw_end_idx") else -1,
-        }
-
-
-def _get_sid_from_path(fpath):
-    if fpath in _PATH_TO_META:
-        return _PATH_TO_META[fpath]["sid"]
-    # Fallback: read NPZ
-    try:
-        with np.load(fpath, allow_pickle=False) as d:
-            sid = d["sid"]
-            if isinstance(sid, np.ndarray) and sid.shape == ():
-                return str(sid.item())
-            return str(sid)
-    except Exception:
-        return None
-
-
-def _get_subject_window_index(fpath):
-    if fpath in _PATH_TO_META:
-        return _PATH_TO_META[fpath]["subject_window_index"]
-    return -1
-
-
-def _get_record_window_index(fpath):
-    if fpath in _PATH_TO_META:
-        return _PATH_TO_META[fpath].get("record_window_index", -1)
-    return -1
-
-
-def _get_master_record(fpath):
-    if fpath in _PATH_TO_META:
-        return _PATH_TO_META[fpath].get("master_record", "")
-    return ""
-
-
-def _get_raw_start_idx(fpath):
-    if fpath in _PATH_TO_META:
-        return _PATH_TO_META[fpath]["raw_start_idx"]
-    return -1
-
-
-# Data lists from the manifest, k-fold partition
-def _sample_list(lst, ratio, seed=DATA_SAMPLE_SEED):
-    ratio = float(ratio)
-    if ratio >= 1.0 or ratio <= 0.0 or len(lst) == 0:
-        return lst
-    n = max(1, int(len(lst) * ratio))
-    rng = np.random.default_rng(seed)
-    idx = rng.choice(len(lst), size=n, replace=False)
-    return [lst[i] for i in idx]
-
-
-def build_lists_from_manifest(train_subj, val_subj, test_subj):
-    if _PROCESSED_MANIFEST is None:
-        raise RuntimeError("Manifest not installed; call install_manifest() first.")
-    df = _PROCESSED_MANIFEST
-    # Rows already sorted by (sid, subject_window_index)
-    train_list = df.loc[df["sid"].isin(train_subj), "npz_path"].tolist()
-    val_list = df.loc[df["sid"].isin(val_subj), "npz_path"].tolist()
-    test_list = df.loc[df["sid"].isin(test_subj), "npz_path"].tolist()
-
-    train_sids = df.loc[df["sid"].isin(train_subj), "sid"].nunique()
-    val_sids = df.loc[df["sid"].isin(val_subj), "sid"].nunique()
-    test_sids = df.loc[df["sid"].isin(test_subj), "sid"].nunique()
-    logging.info(
-        "Lists from manifest: "
-        f"Train={len(train_list)} segments ({train_sids} subjects), "
-        f"Val={len(val_list)} segments ({val_sids} subjects), "
-        f"Test={len(test_list)} segments ({test_sids} subjects)"
-    )
-
-    train_list = _sample_list(train_list, DATA_SAMPLE_RATIO)
-    val_list = _sample_list(val_list, DATA_SAMPLE_RATIO)
-    test_list = _sample_list(test_list, DATA_SAMPLE_RATIO)
-    return train_list, val_list, test_list
-
-
-def infer_subject_splits_from_manifest(train_ratio=0.7, val_ratio=0.1, test_ratio=0.2):
-    if _PROCESSED_MANIFEST is None:
-        raise RuntimeError("Manifest not installed.")
-    subjects = sorted(_PROCESSED_MANIFEST["sid"].unique().tolist())
-    n = len(subjects)
-    if n == 0:
-        return set(), set(), set()
-    ratios = np.array([max(0.0, float(train_ratio)),
-                       max(0.0, float(val_ratio)),
-                       max(0.0, float(test_ratio))], dtype=np.float64)
-    s = ratios.sum()
-    ratios = ratios / s if s > 0 else np.array([1.0, 0.0, 0.0], dtype=np.float64)
-    n_train = int(np.floor(n * ratios[0]))
-    n_val   = int(np.floor(n * ratios[1]))
-    n_test  = max(0, n - n_train - n_val)
-    quotas = np.array([n_train, n_val, n_test], dtype=np.int64)
-    credits = np.zeros(3, dtype=np.float64)
-    bins = [[], [], []]
-    for sid in subjects:
-        for _ in range(3):
-            credits += ratios
-            masked = credits.copy()
-            for i in range(3):
-                if quotas[i] <= 0:
-                    masked[i] = -1e18
-            idx = int(np.argmax(masked))
-            if quotas[idx] > 0:
-                bins[idx].append(sid)
-                quotas[idx] -= 1
-                credits[idx] -= 1.0
-                break
-        else:
-            idx = int(np.argmax([len(b) for b in bins]))
-            bins[idx].append(sid)
-    return set(bins[0]), set(bins[1]), set(bins[2])
-
-
-def _subject_bp_key_fn(subj_stats, sort_key="sbp"):
-    def key_fn(sid):
-        sbp, dbp = subj_stats.get(sid, (np.nan, np.nan))
-        if sort_key == "dbp":
-            v = dbp
-        elif sort_key == "mean":
-            v = ((sbp + dbp) / 2.0
-                 if (np.isfinite(sbp) and np.isfinite(dbp)) else np.nan)
-        else:  # 'sbp' (default)
-            v = sbp
-        return float(v) if np.isfinite(v) else np.inf
-    return key_fn
-
-
-def compute_subject_bp_stats_from_manifest(max_windows_per_subject=None):
-    if _PROCESSED_MANIFEST is None:
-        raise RuntimeError("Manifest not installed; cannot compute subject BP stats.")
-    df = _PROCESSED_MANIFEST
-    stats = {}
-    for sid, grp in tqdm(df.groupby("sid", sort=True),
-                         desc="K-fold: per-subject BP stats"):
-        paths = grp["npz_path"].tolist()
-        if max_windows_per_subject and len(paths) > int(max_windows_per_subject):
-            idx = np.unique(
-                np.linspace(0, len(paths) - 1, int(max_windows_per_subject))
-                .astype(int)
-            )
-            paths = [paths[i] for i in idx]
-        sbps, dbps = [], []
-        for p in paths:
-            try:
-                with np.load(p) as d:
-                    y = d["Y"]
-                sbp_m, dbp_m, _ = _segment_bp_means_from_wave(y)
-                if np.isfinite(sbp_m):
-                    sbps.append(sbp_m)
-                if np.isfinite(dbp_m):
-                    dbps.append(dbp_m)
-            except Exception:
-                continue
-        if sbps:
-            stats[str(sid)] = (
-                float(np.mean(sbps)),
-                float(np.mean(dbps)) if dbps else np.nan,
-            )
-    return stats
-
-
-def stratified_subject_kfold(subj_stats, all_subjects, n_splits,
-                             sort_key="sbp", seed=KFOLD_SEED):
-    subjects = sorted({str(s) for s in all_subjects})
-    n = len(subjects)
-    n_splits = max(2, min(int(n_splits), n)) if n >= 2 else 1
-
-    if sort_key:
-        key_fn = _subject_bp_key_fn(subj_stats, sort_key)
-        ordered = sorted(subjects, key=lambda x: (key_fn(x), x))
-    else:
-        rng = random.Random(int(seed))
-        ordered = subjects[:]
-        rng.shuffle(ordered)
-
-    folds = [[] for _ in range(n_splits)]
-    for i, sid in enumerate(ordered):
-        folds[i % n_splits].append(sid)
-    return [set(f) for f in folds]
-
-
-def make_kfold_split(all_subjects, test_subjects, val_ratio, subj_stats,
-                     sort_key="sbp"):
-    test_subj = {str(s) for s in test_subjects}
-    non_test = [str(s) for s in all_subjects if str(s) not in test_subj]
-    non_test_stats = {s: subj_stats.get(s, (np.nan, np.nan)) for s in non_test}
-    vr = max(0.0, min(0.9, float(val_ratio)))
-    train_subj, val_subj, leftover = stratified_snake_split(
-        non_test_stats,
-        train_ratio=1.0 - vr, val_ratio=vr, test_ratio=0.0,
-        sort_key=(sort_key or "sbp"),
-    )
-    # stratified_snake_split assigns integer-floored quotas.
-    train_subj = set(train_subj) | set(leftover)
-    return train_subj, set(val_subj), set(test_subj)
-
-
-# Preprocessing driver
-def data_preprocessing(split_json_path: str, processed_manifest_path: str):
-    old_npz = sorted(glob.glob(os.path.join(processed_dir, "*.npz")))
-
-    if REUSE_PROCESSED:
-        if not old_npz:
-            raise RuntimeError(f"REUSE_PROCESSED=True but no .npz in folder: {processed_dir}")
-
-        # Try loading existing manifest
-        manifest = load_processed_manifest(processed_manifest_path)
-        if manifest is None:
-            logging.info("No processed_manifest.csv found; rebuilding from NPZ metadata...")
-            manifest = build_or_update_processed_manifest(old_npz, processed_manifest_path)
-        else:
-            logging.info(f"Loaded existing manifest: {processed_manifest_path}")
-            # If new NPZ files exist that aren't in manifest, rebuild
-            manifest_paths = set(manifest["npz_path"].tolist())
-            missing = [p for p in old_npz if p not in manifest_paths]
-            if missing:
-                logging.info(f"{len(missing)} new NPZ files not in manifest; rebuilding...")
-                manifest = build_or_update_processed_manifest(old_npz, processed_manifest_path)
-
-        install_manifest(manifest)
-
-        loaded = load_split_json(split_json_path)
-        if loaded is not None:
-            train_subj, val_subj, test_subj = loaded
-            logging.info("Using existing subject splits.")
-        else:
-            logging.info("No subject splits found; infer from manifest.")
-            train_subj, val_subj, test_subj = infer_subject_splits_from_manifest(
-                train_ratio, val_ratio, test_ratio)
-            save_split_json(train_subj, val_subj, test_subj, split_json_path)
-        return build_lists_from_manifest(train_subj, val_subj, test_subj)
-
-    # Full rebuild path
-    mapping, used_df = read_subject_file_maps(SUBJECT_FILE_MAP_PATHS)
-    csv_files = sorted(mapping.keys())
-    if not csv_files:
-        raise FileNotFoundError("No usable CSV files in subject_file_map.csv")
-    csv_files = csv_files[:int(len(csv_files) * data_usage_ratio)]
-    used_df = used_df[used_df["csv_path"].isin(csv_files)].copy()
-    file2subj = mapping
-
-    loaded = load_split_json(split_json_path)
-    if loaded is not None and old_npz:
-        train_subj, val_subj, test_subj = loaded
-        logging.info("Using saved subject splits")
-    else:
-        subj_stats = compute_subject_bp_stats(csv_files, file2subj)
-        train_subj, val_subj, test_subj = stratified_snake_split(
-            subj_stats, train_ratio, val_ratio, test_ratio
-        )
-        save_split_json(train_subj, val_subj, test_subj, split_json_path)
-
-    if old_npz:
-        logging.info(f"Deleting {len(old_npz)} old NPZ files...")
-        for f in old_npz:
-            try:
-                os.remove(f)
-            except Exception:
-                pass
-
-    logging.info(f"Start processing {len(csv_files)} CSV files using {WORKERS} workers...")
-    seg_counts = {fp: 0 for fp in csv_files}
-    raw_warns = []
-
-    with tqdm(total=len(csv_files), desc="Phase-B: processing progress") as pbar, \
-         ProcessPoolExecutor(max_workers=WORKERS) as exe:
-        future_to_file = {
-            exe.submit(process_single_csv, (fp, file2subj[fp])): fp
-            for fp in csv_files
-        }
-        for future in as_completed(future_to_file):
-            fp = future_to_file[future]
-            try:
-                paths, warn = future.result()
-                seg_counts[fp] = len(paths)
-                if warn:
-                    raw_warns.append(warn)
-            except Exception as e:
-                logging.error(f"Error processing file {fp}: {str(e)}")
-            pbar.update(1)
-
-    if raw_warns:
-        for w in raw_warns[:10]:
-            logging.warning(w)
-        logging.warning(f"Total CSVs missing raw_sample_idx: {len(raw_warns)}")
-
-    summary_df = used_df.copy()
-    summary_df["segments_saved"] = summary_df["csv_path"].map(seg_counts).fillna(0).astype(int)
-    summary_df[["subject_id", "input_file", "output_csv", "segments_saved"]].to_csv(
-        SUBJECT_FILE_MAP_OUTPUT_PATH, index=False
-    )
-    logging.info(f"Processing summary saved to: {SUBJECT_FILE_MAP_OUTPUT_PATH}")
-
-    new_npz = sorted(glob.glob(os.path.join(processed_dir, "*.npz")))
-    if not new_npz:
-        raise RuntimeError("No segments produced")
-    manifest = build_or_update_processed_manifest(new_npz, processed_manifest_path)
-    install_manifest(manifest)
-    return build_lists_from_manifest(train_subj, val_subj, test_subj)
-
-
-# ABP normalization stats
-def compute_global_abp_stats(train_files):
-    global GLOBAL_ABP_MIN, GLOBAL_ABP_MAX
-    all_mins, all_maxs = [], []
-    for filepath in tqdm(train_files, desc="Compute training ABP stats"):
-        try:
-            data = np.load(filepath)
-            Y = data['Y']
-            all_mins.append(np.min(Y))
-            all_maxs.append(np.max(Y))
-        except Exception as e:
-            logging.warning(f"Error processing file {filepath}: {e}")
-            continue
-    if not all_mins or not all_maxs:
-        raise RuntimeError("Unable to compute ABP stats; data may be invalid")
-    GLOBAL_ABP_MIN = float(np.min(all_mins))
-    GLOBAL_ABP_MAX = float(np.max(all_maxs))
-    logging.info(f"ABP range: {GLOBAL_ABP_MIN:.2f} - {GLOBAL_ABP_MAX:.2f} mmHg")
-    return GLOBAL_ABP_MIN, GLOBAL_ABP_MAX
-
-
-def save_abp_stats(path):
-    with open(path, "w") as f:
-        json.dump({"GLOBAL_ABP_MIN": GLOBAL_ABP_MIN,
-                   "GLOBAL_ABP_MAX": GLOBAL_ABP_MAX}, f)
-    logging.info(f"Saved normalization stats to {path}")
-
-
-def _load_saved_norm_stats(path: str) -> bool:
-    global GLOBAL_ABP_MIN, GLOBAL_ABP_MAX
-    if not path or not os.path.isfile(path):
-        return False
-    try:
-        with open(path, "r") as f:
-            d = json.load(f)
-        GLOBAL_ABP_MIN = d.get("GLOBAL_ABP_MIN", GLOBAL_ABP_MIN)
-        GLOBAL_ABP_MAX = d.get("GLOBAL_ABP_MAX", GLOBAL_ABP_MAX)
-        if GLOBAL_ABP_MIN is not None and GLOBAL_ABP_MAX is not None:
-            logging.info(f"Loaded normalization stats: {path}")
-        return True
-    except Exception as e:
-        logging.warning(f"Failed to read normalization stats: {e}")
-        return False
-
-
-# Segment loading, datasets, BP readout
-def load_segment(filepath, apply_filter=True):
-    try:
-        with np.load(filepath) as data:
-            X = data['X']
-            Y = data['Y']
-            keys = set(getattr(data, 'files', []))
-            abp_min = float(data['abp_min']) if 'abp_min' in keys else float(np.min(Y))
-            abp_max = float(data['abp_max']) if 'abp_max' in keys else float(np.max(Y))
-
-        if apply_filter and APPLY_FILTERING and X is not None:
-            try:
-                # Spike/outlier removal BEFORE bandpass: hampel suppresses impulse-like artifacts that would.
-                X[:, 0] = hampel_filter(X[:, 0])
-                X[:, 0] = filtfilt(b_bp, a_bp, X[:, 0])
-            except Exception:
-                pass
-
-        if X is not None and Y is not None:
-            target_len = max(1, (len(Y) // 16) * 16)
-            if target_len < len(Y):
-                X = X[:target_len, :]
-                Y = Y[:target_len]
-        return X, Y, abp_min, abp_max
-    except Exception as e:
-        logging.error(f"Failed to load {filepath}: {e}")
-        return None, None, 0, 0
-
-
-def normalize_ppg_ecg_segment(signals: np.ndarray):
-    if signals is None or signals.ndim != 2 or signals.shape[1] < 2:
-        stats = np.zeros(4, dtype=np.float32)
-        return signals, stats
-    normalized = signals.astype(np.float32).copy()
-    stats = []
-    for ch in (0, 1):
-        sig = normalized[:, ch]
-        s_min = float(np.min(sig))
-        s_max = float(np.max(sig))
-        denom = s_max - s_min
-        if denom < 1e-6:
-            normalized[:, ch] = 0.0
-        else:
-            normalized[:, ch] = (sig - s_min) / denom
-        stats.extend([s_min, s_max])
-    return normalized, np.asarray(stats, dtype=np.float32)
-
-
-def smooth_signal(sig, win=5):
-    if win < 2:
-        return sig
-    return np.convolve(sig, np.ones(win) / win, mode="same")
-
-
-def detect_sbp_dbp(sig, fs=FS):
-    s = smooth_signal(sig)
-    dist = int(0.32 * fs)
-    sys_idx, _ = find_peaks(s, distance=dist)
-    dia_idx, _ = find_peaks(-s, distance=dist)
-    return sig[sys_idx], sig[dia_idx]
-
-
-def _bp_targets_from_wave(abp_wave: np.ndarray):
-    sbp_vals, dbp_vals = detect_sbp_dbp(abp_wave)
-    sbp_mean = float(np.mean(sbp_vals)) if len(sbp_vals) > 0 else float(np.max(abp_wave))
-    dbp_mean = float(np.mean(dbp_vals)) if len(dbp_vals) > 0 else float(np.min(abp_wave))
-    return sbp_mean, dbp_mean
-
-
-def _segment_bp_means_from_wave(y: np.ndarray):
-    try:
-        sbp_vals, dbp_vals = detect_sbp_dbp(y)
-        sbp_mean = float(np.mean(sbp_vals)) if len(sbp_vals) > 0 else np.nan
-        dbp_mean = float(np.mean(dbp_vals)) if len(dbp_vals) > 0 else np.nan
-        abp_mean = float(np.mean(y)) if y is not None and y.size > 0 else np.nan
-        return sbp_mean, dbp_mean, abp_mean
-    except Exception:
-        return np.nan, np.nan, np.nan
-
-
-# Calibration pair selection — per-master static first-N (no leakage from target ABP.
+# Same RNG / cuDNN / matmul state at the start of the run and of every variant.
+def _reset_torch_state():
+    set_global_seed(GLOBAL_SEED, bool(SEED_DETERMINISTIC))
+    if not bool(SEED_DETERMINISTIC):
+        torch.backends.cudnn.benchmark = True
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("high")
+
+
+# Calibration pair selection — per-master static first-N (no leakage from target ABP).
 CALIBRATION_MODE_TAG = "per_master_record_static_first_n"
 # Pool [pool_end - N, pool_end) is fixed per master; one cal pair shared by all its targets.
 CALIBRATION_MODE_TAG_JUST_BEFORE_TARGET = "per_master_fixed_n_just_before_first_target"
@@ -1418,17 +354,17 @@ def _active_calibration_mode_tag() -> str:
 def select_calibration_pairs(file_list, output_pairs_path: Optional[str] = None,
                              output_summary_path: Optional[str] = None):
     global _WINDOW_CAL_PAIRS
-    if _PROCESSED_MANIFEST is None:
+    if preprocess.manifest() is None:
         raise RuntimeError("Manifest not installed; cannot select calibration pairs.")
 
-    df = _PROCESSED_MANIFEST.copy()
+    df = preprocess.manifest().copy()
     needs_attach = (
         "record_window_index" not in df.columns
         or "master_record" not in df.columns
         or "subject_window_index" not in df.columns
     )
     if needs_attach:
-        df = _attach_record_and_subject_indices(df)
+        df = attach_record_and_subject_indices(df)
 
     N = int(CALIBRATION_WINDOW_COUNT)
 
@@ -1524,7 +460,7 @@ def select_calibration_pairs(file_list, output_pairs_path: Optional[str] = None,
                 try:
                     with np.load(rows.loc[i, "npz_path"], allow_pickle=False) as d:
                         y = d["Y"]
-                    s, db = _bp_targets_from_wave(y)
+                    s, db = bp_targets_from_wave(y)
                 except Exception:
                     continue
                 if not (np.isfinite(s) and np.isfinite(db)):
@@ -1700,7 +636,7 @@ def _validate_calibration_pairs_random(window_cal_pairs, n_window_count: int,
     for tgt, p in chosen:
         cl_rwi = int(p["cal_low_record_window_index"])
         ch_rwi = int(p["cal_high_record_window_index"])
-        target_rwi = _get_record_window_index(tgt)
+        target_rwi = get_record_window_index(tgt)
         pool_start = int(p.get("pool_start_rwi", 0))
         pool_end = int(p.get("pool_end_rwi", n_window_count))
 
@@ -1803,7 +739,7 @@ def filter_target_lists(train_l, val_l, test_l, valid_sids):
     def _keep(fp):
         if fp not in _WINDOW_CAL_PAIRS:
             return False
-        if _get_record_window_index(fp) < CALIBRATION_WINDOW_COUNT:
+        if get_record_window_index(fp) < CALIBRATION_WINDOW_COUNT:
             return False
         return True
 
@@ -1885,7 +821,7 @@ def _sbp_dbp_from_batch(y_norm: torch.Tensor):
     y_np = denormalize_abp(y_norm.detach().cpu().numpy())
     sbp_list, dbp_list = [], []
     for row in y_np:
-        sbp, dbp = _bp_targets_from_wave(row)
+        sbp, dbp = bp_targets_from_wave(row)
         sbp_list.append(sbp)
         dbp_list.append(dbp)
     sbp_t = torch.tensor(sbp_list, dtype=torch.float32, device=y_norm.device)
@@ -1944,15 +880,46 @@ def _forward_one_batch(model, batch_data, device, *, use_calibration: bool):
     return wave_pred, sbp_pred, dbp_pred, targets
 
 
+def _is_gate_param(name: str) -> bool:
+    return any(f"decoder.ag{i}." in name for i in (0, 1, 2))
+
+
+# AdamW over the model. With a gate rate (GATE_LEARNING_RATE unless overridden), decoder.ag*
+# form a second param group at that rate and the rest trains at lr; otherwise one group at lr.
+def _make_optimizer(model, lr: float, gate_lr: Optional[float] = None):
+    gate_lr = GATE_LEARNING_RATE if gate_lr is None else gate_lr
+    gate_params, backbone_params = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if gate_lr is not None and _is_gate_param(name):
+            gate_params.append(p)
+        else:
+            backbone_params.append(p)
+    if not gate_params:
+        return optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-3, eps=1e-8)
+    gate_lr = float(gate_lr)
+    logging.info(
+        f"Optimizer param groups: backbone lr={lr}, skip-gate lr={gate_lr} "
+        f"({sum(p.numel() for p in gate_params)} gate params, "
+        f"{sum(p.numel() for p in backbone_params)} backbone params)"
+    )
+    return optim.AdamW(
+        [{"params": backbone_params, "lr": lr}, {"params": gate_params, "lr": gate_lr}],
+        weight_decay=1e-3, eps=1e-8,
+    )
+
+
 def train_model(model, train_loader, val_loader, num_epochs, device,
                 checkpoint_path: str, plot_curve: bool = True,
                 *, use_calibration: bool = True,
                 history_title: Optional[str] = None,
                 lr: Optional[float] = None,
+                gate_lr: Optional[float] = None,
                 return_best_val: bool = False):
     criterion = WaveformLoss()
     lr_used = float(lr) if lr is not None else float(learning_rate)
-    optimizer = optim.AdamW(model.parameters(), lr=lr_used, weight_decay=1e-3, eps=1e-8)
+    optimizer = _make_optimizer(model, lr_used, gate_lr)
     total_steps = max(1, num_epochs * len(train_loader))
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=total_steps, eta_min=lr_used * 0.01
@@ -2081,8 +1048,10 @@ def log_selected_model():
         logging.info(f"  k-fold            : {'ON' if USE_KFOLD else 'OFF'}"
                      f"  n_splits={KFOLD_N_SPLITS} val_ratio={KFOLD_VAL_RATIO}"
                      f" stratify={KFOLD_STRATIFY_KEY} seed={KFOLD_SEED}")
+    search = (f"{OPTUNA_N_TRIALS} TPE trials over (lr, gate_lr)" if GATE_LEARNING_RATE is not None
+              else f"{len(OPTUNA_LR_GRID)} fixed lr")
     logging.info(f"  optuna LR search  : {'ON' if USE_OPTUNA_LR_SEARCH else 'OFF'}"
-                 + (f"  {len(OPTUNA_LR_GRID)} fixed lr x {OPTUNA_EPOCHS} epochs"
+                 + (f"  {search} x {OPTUNA_EPOCHS} epochs"
                     + ("  per fold" if OPTUNA_PER_FOLD
                        else f"  fold={OPTUNA_FOLD}  then_kfold={bool(OPTUNA_THEN_KFOLD)}")
                     if USE_OPTUNA_LR_SEARCH else ""))
@@ -2112,7 +1081,7 @@ _ADAPTER_NO_KEY_SENTINEL = "__UNSET__"
 
 # Per-master residual adapter fine-tune
 def _path_to_master_key(fp):
-    meta = _PATH_TO_META.get(fp)
+    meta = preprocess.meta_for(fp)
     if not meta:
         return None
     return (str(meta["sid"]), str(meta["master_record"]))
@@ -2256,7 +1225,7 @@ def _adapter_record_fields(model, fp, *, use_calibration: bool):
 
 
 def _build_pool_paths_by_master(window_cal_pairs):
-    if _PROCESSED_MANIFEST is None:
+    if preprocess.manifest() is None:
         raise RuntimeError("Manifest not installed; cannot derive pool paths.")
     master_pool = {}
     for p in window_cal_pairs.values():
@@ -2264,7 +1233,7 @@ def _build_pool_paths_by_master(window_cal_pairs):
         ps = int(p.get("pool_start_rwi", 0))
         pe = int(p.get("pool_end_rwi", CALIBRATION_WINDOW_COUNT))
         master_pool[key] = (ps, pe)
-    df = _PROCESSED_MANIFEST
+    df = preprocess.manifest()
     out = {}
     for key, (ps, pe) in master_pool.items():
         sid, master = key
@@ -2331,13 +1300,14 @@ def _load_cal_pair_tensors(cal_ctx):
 
 
 def _bp_scalars_from_pred_normalized(pred_norm: torch.Tensor):
-    if GLOBAL_ABP_MIN is None or GLOBAL_ABP_MAX is None:
+    abp_min, abp_max = preprocess.GLOBAL_ABP_MIN, preprocess.GLOBAL_ABP_MAX
+    if abp_min is None or abp_max is None:
         raise RuntimeError(
-            "GLOBAL_ABP_MIN / GLOBAL_ABP_MAX not initialized; cannot "
+            "ABP normalization stats not initialized; cannot "
             "denormalize predicted waveform for adapter scalar fine-tune."
         )
-    span = float(GLOBAL_ABP_MAX) - float(GLOBAL_ABP_MIN)
-    pred_mmhg = pred_norm * span + float(GLOBAL_ABP_MIN)
+    span = float(abp_max) - float(abp_min)
+    pred_mmhg = pred_norm * span + float(abp_min)
     L = int(pred_mmhg.size(-1))
     K = max(int(ADAPTER_BP_READOUT_K_MIN),
             int(round(L * float(ADAPTER_BP_READOUT_FRAC))))
@@ -2380,7 +1350,7 @@ def _finetune_one_master(eval_model, pool_tensors, cal_ctx, device,
             sbp_lab = np.empty(n_total, dtype=np.float32)
             dbp_lab = np.empty(n_total, dtype=np.float32)
             for i in range(n_total):
-                s, d = _bp_targets_from_wave(y_np_denorm[i])
+                s, d = bp_targets_from_wave(y_np_denorm[i])
                 sbp_lab[i] = s
                 dbp_lab[i] = d
             sbp_lab_t = torch.from_numpy(sbp_lab).to(device)
@@ -2723,14 +1693,13 @@ def save_run_manifest(path, *, run_dir, checkpoint_path, calibration_pairs_path,
         "STEP_SIZE": int(STEP_SIZE),
         "APPLY_FILTERING": bool(APPLY_FILTERING),
         "USE_SIGNAL_STATS": bool(USE_SIGNAL_STATS),
-        "GLOBAL_ABP_MIN": GLOBAL_ABP_MIN,
-        "GLOBAL_ABP_MAX": GLOBAL_ABP_MAX,
+        "GLOBAL_ABP_MIN": preprocess.GLOBAL_ABP_MIN,
+        "GLOBAL_ABP_MAX": preprocess.GLOBAL_ABP_MAX,
         "BASE_CHANNELS": int(BASE_CHANNELS),
         "DROPOUT_P": float(DROPOUT_P),
         # Which models/*.py this run used, and the model-owned settings that came.
         "MODEL": MODEL_NAME,
         "MODEL_MODULE": f"models/{MODEL_SPEC.module}.py",
-        "MODEL_SOURCE_PROJECT": MODEL_SPEC.source_project,
         "USE_PER_MASTER_ADAPTER": bool(USE_PER_MASTER_ADAPTER),
         "ADAPTER_FT_OBJECTIVE": ADAPTER_FT_OBJECTIVE or "",
         "NO_CAL_BASELINES": list(NO_CAL_BASELINES),
@@ -2743,6 +1712,7 @@ def save_run_manifest(path, *, run_dir, checkpoint_path, calibration_pairs_path,
         "batch_size": int(batch_size),
         "epochs": int(epochs),
         "learning_rate": float(learning_rate),
+        "GATE_LEARNING_RATE": GATE_LEARNING_RATE,
         "CALIBRATION_WINDOW_COUNT": int(CALIBRATION_WINDOW_COUNT),
         "USE_BOTTLENECK_RIDGE_PROBE": bool(USE_BOTTLENECK_RIDGE_PROBE),
         "BOTTLENECK_RIDGE_USE_TRAIN_VAL": bool(BOTTLENECK_RIDGE_USE_TRAIN_VAL),
@@ -2820,114 +1790,87 @@ def _set_bn_momentum(m, momentum=0.01):
             mod.momentum = momentum
 
 
-def _build_calibration_unet(device):
-    m = CalibrationUNet(input_channels=3, base_channels=BASE_CHANNELS).to(device)
-    _set_bn_momentum(m, momentum=0.01)
-    if USE_COMPILE and hasattr(torch, "compile"):
-        try:
-            m = torch.compile(m)
-            logging.info("Enabled torch.compile acceleration")
-        except Exception as e:
-            logging.warning(f"torch.compile failed: {e}")
-    return m
-
-
-def _build_plain_unet_no_cal(device):
-    m = PlainUNet3LNoCal(input_channels=3, base_channels=BASE_CHANNELS,
-                         use_signal_stats=bool(USE_SIGNAL_STATS)).to(device)
-    _set_bn_momentum(m, momentum=0.01)
-    if USE_COMPILE and hasattr(torch, "compile"):
-        try:
-            m = torch.compile(m)
-            logging.info("Enabled torch.compile acceleration (no-cal model)")
-        except Exception as e:
-            logging.warning(f"torch.compile failed: {e}")
-    return m
-
-
-def _compile_no_cal(m, tag):
-    _set_bn_momentum(m, momentum=0.01)
-    if USE_COMPILE and hasattr(torch, "compile"):
-        try:
-            m = torch.compile(m)
-            logging.info(f"Enabled torch.compile acceleration ({tag})")
-        except Exception as e:
-            logging.warning(f"torch.compile failed: {e}")
-    return m
-
-
-def _build_mamba_unet_no_cal(device):
-    m = model_lib.MambaUNet3LNoCal(
-        input_channels=3, base_channels=BASE_CHANNELS,
-        use_signal_stats=bool(USE_SIGNAL_STATS),
-    ).to(device)
-    return _compile_no_cal(m, "mamba no-cal model")
-
-
-def _build_mamba_unet_no_cal_d16(device):
-    m = model_lib.MambaUNet3LNoCal(
-        input_channels=3, base_channels=BASE_CHANNELS,
-        use_signal_stats=bool(USE_SIGNAL_STATS),
-        ag_d_state=16,
-    ).to(device)
-    return _compile_no_cal(m, "mamba no-cal model, d_state=16")
-
-
-def _build_transformer_unet_no_cal(device):
-    m = model_lib.TransformerUNet3LNoCal(
-        input_channels=3, base_channels=BASE_CHANNELS,
-        use_signal_stats=bool(USE_SIGNAL_STATS),
-        **_GATE_KWARGS,
-    ).to(device)
-    return _compile_no_cal(m, "transformer no-cal model")
-
-
-# variant -> how to build it, what to call it, where its checkpoint goes.
-_NO_CAL_VARIANT_SPEC = {
+# variant -> model name, class on the selected models/*.py, checkpoint file, extra ctor kwargs.
+_VARIANT_MODELS = {
+    VARIANT_CALIBRATED: {
+        "model_name": "CalibrationUNet",
+        "class_name": "CalibrationUNet",
+        "checkpoint_basename": CHECKPOINT_BASENAME_CAL,
+        "extra_kwargs": {},
+    },
+    VARIANT_NO_CALIBRATION: {
+        "model_name": "PlainUNet3LNoCal",
+        "class_name": "PlainUNet3LNoCal",
+        "checkpoint_basename": CHECKPOINT_BASENAME_NO_CAL,
+        "extra_kwargs": {},
+    },
     VARIANT_NO_CAL_UNET_MAMBA: {
         "model_name": "MambaUNet3LNoCal",
         "class_name": "MambaUNet3LNoCal",
         "checkpoint_basename": CHECKPOINT_BASENAME_NO_CAL_MAMBA,
         "extra_kwargs": {"ag_d_state": 8},
-        "train_builder": _build_mamba_unet_no_cal,
-        "eval_factory": lambda device: model_lib.MambaUNet3LNoCal(
-            input_channels=3, base_channels=BASE_CHANNELS,
-            use_signal_stats=bool(USE_SIGNAL_STATS),
-        ).to(device),
-    },
-    VARIANT_NO_CAL_UNET_MAMBA_D16: {
-        "model_name": "MambaUNet3LNoCal_d16",
-        "class_name": "MambaUNet3LNoCal",
-        "checkpoint_basename": CHECKPOINT_BASENAME_NO_CAL_MAMBA_D16,
-        "extra_kwargs": {"ag_d_state": 16},
-        "train_builder": _build_mamba_unet_no_cal_d16,
-        "eval_factory": lambda device: model_lib.MambaUNet3LNoCal(
-            input_channels=3, base_channels=BASE_CHANNELS,
-            use_signal_stats=bool(USE_SIGNAL_STATS),
-            ag_d_state=16,
-        ).to(device),
     },
     VARIANT_NO_CAL_UNET_TRANSFORMER: {
         "model_name": "TransformerUNet3LNoCal",
         "class_name": "TransformerUNet3LNoCal",
         "checkpoint_basename": CHECKPOINT_BASENAME_NO_CAL_TRANSFORMER,
-        # Carried into test.py's test-only dispatch so a re-test rebuilds the same gate the checkpoint.
+        # Recorded so a test-only re-run rebuilds the same gate the checkpoint was trained with.
         "extra_kwargs": dict(_GATE_KWARGS),
-        "train_builder": _build_transformer_unet_no_cal,
-        "eval_factory": lambda device: model_lib.TransformerUNet3LNoCal(
-            input_channels=3, base_channels=BASE_CHANNELS,
-            use_signal_stats=bool(USE_SIGNAL_STATS),
-            **_GATE_KWARGS,
-        ).to(device),
     },
 }
+
+
+def _variant_for_model_name(model_name, *, use_calibration):
+    """Variant behind a run manifest's model_name; unknown no-cal names mean the plain baseline."""
+    if use_calibration:
+        return VARIANT_CALIBRATED
+    for variant, spec in _VARIANT_MODELS.items():
+        if variant != VARIANT_CALIBRATED and spec["model_name"] == model_name:
+            return variant
+    return VARIANT_NO_CALIBRATION
+
+
+# Fresh, uncompiled model on device: the eval model, and the training model before compile.
+def _new_model(variant, device):
+    spec = _VARIANT_MODELS[variant]
+    cls = getattr(model_lib, spec["class_name"])
+    if variant == VARIANT_CALIBRATED:
+        m = cls(input_channels=3, base_channels=BASE_CHANNELS)
+    else:
+        m = cls(input_channels=3, base_channels=BASE_CHANNELS,
+                use_signal_stats=bool(USE_SIGNAL_STATS), **spec["extra_kwargs"])
+    return m.to(device)
+
+
+def _build_train_model(variant, device):
+    m = _new_model(variant, device)
+    _set_bn_momentum(m, momentum=0.01)
+    if USE_COMPILE and hasattr(torch, "compile"):
+        try:
+            m = torch.compile(m)
+            logging.info(f"Enabled torch.compile acceleration ({_VARIANT_MODELS[variant]['model_name']})")
+        except Exception as e:
+            logging.warning(f"torch.compile failed: {e}")
+    return m
+
+
+def _make_loaders(train_list, val_list, window_cal_pairs, *, use_calibration):
+    if use_calibration:
+        train_dataset = CalibrationBPDataset(train_list, window_cal_pairs)
+        val_dataset = CalibrationBPDataset(val_list, window_cal_pairs)
+    else:
+        train_dataset = BloodPressureDataset(train_list)
+        val_dataset = BloodPressureDataset(val_list)
+    dl_kwargs = _make_dataloader_kwargs()
+    return (DataLoader(train_dataset, shuffle=True, **dl_kwargs),
+            DataLoader(val_dataset, shuffle=False, **dl_kwargs))
 
 
 # Variant / N / fold orchestration
 def _count_subjects(flist):
     sids = set()
     for fp in flist:
-        sid = _get_sid_from_path(fp)
+        sid = get_sid_from_path(fp)
         if sid is not None:
             sids.add(sid)
     return len(sids)
@@ -2936,8 +1879,8 @@ def _count_subjects(flist):
 def _count_master_records(flist):
     masters = set()
     for fp in flist:
-        sid = _get_sid_from_path(fp)
-        master = _get_master_record(fp)
+        sid = get_sid_from_path(fp)
+        master = get_master_record(fp)
         if sid is not None and master:
             masters.add((sid, master))
     return len(masters)
@@ -2981,43 +1924,95 @@ def _maybe_attach_calibration_columns(records, *, use_calibration: bool):
     return cleaned
 
 
+def _split_counts(train_list, val_list, test_list):
+    return {
+        "n_subj_train": _count_subjects(train_list),
+        "n_subj_val": _count_subjects(val_list),
+        "n_subj_test": _count_subjects(test_list),
+        "n_master_train": _count_master_records(train_list),
+        "n_master_val": _count_master_records(val_list),
+        "n_master_test": _count_master_records(test_list),
+    }
+
+
+# Manifest copy with a split column: train / val / test, calibration (cal-only windows), unused.
+def _label_manifest_split(manifest, train_list, val_list, test_list, window_cal_pairs):
+    labelled = manifest.copy()
+    labelled["split"] = "unused"
+    target_paths = set(train_list) | set(val_list) | set(test_list)
+    labelled.loc[labelled["npz_path"].isin(train_list), "split"] = "train"
+    labelled.loc[labelled["npz_path"].isin(val_list), "split"] = "val"
+    labelled.loc[labelled["npz_path"].isin(test_list), "split"] = "test"
+    cal_only_paths = set()
+    for p in (window_cal_pairs or {}).values():
+        for k in ("cal_low_path", "cal_high_path"):
+            cp = p.get(k)
+            if cp and cp not in target_paths:
+                cal_only_paths.add(cp)
+    labelled.loc[labelled["npz_path"].isin(cal_only_paths), "split"] = "calibration"
+    return labelled
+
+
+# Train and test every variant under parent_run_dir, write the compare summary and bar plot,
+# and return the summary rows.
+def _run_variants(variants, *, parent_run_dir, N, train_list, val_list, test_list,
+                  window_cal_pairs, counts, processed_manifest_df, device, test_mod,
+                  cal_summary_path, split_json_path, log_tag):
+    variant_results = []
+    for v in variants:
+        variant_results.append(_run_one_variant(
+            variant=v,
+            parent_run_dir=parent_run_dir,
+            train_list=train_list, val_list=val_list, test_list=test_list,
+            window_cal_pairs=window_cal_pairs,
+            processed_manifest_df=processed_manifest_df,
+            device=device, test_mod=test_mod,
+            shared_cal_summary_path=cal_summary_path,
+            shared_split_json_path=split_json_path,
+            **counts,
+        ))
+
+    compare_csv = _save_compare_summary(parent_run_dir, variant_results)
+    rows = []
+    try:
+        rows = pd.read_csv(compare_csv).to_dict("records")
+    except Exception as e:
+        logging.warning(f"[{log_tag}] compare summary fold-in failed: {e}")
+    try:
+        _plot_compare_bar(
+            variant_results, N=int(N),
+            out_path=os.path.join(parent_run_dir, "compare_bar.png"),
+        )
+    except Exception as e:
+        logging.warning(f"[{log_tag}] comparison plot failed: {e}")
+    return rows
+
+
 def _run_one_variant(*, variant, parent_run_dir, train_list, val_list, test_list,
                      window_cal_pairs, n_subj_train, n_subj_val, n_subj_test,
                      n_master_train, n_master_val, n_master_test,
                      processed_manifest_df, device, test_mod,
                      shared_cal_summary_path: str = "",
                      shared_split_json_path: str = ""):
-    global RUN_DIR, GLOBAL_ABP_MIN, GLOBAL_ABP_MAX
+    global RUN_DIR
 
     use_calibration = (variant == VARIANT_CALIBRATED)
     sub_dir = os.path.join(parent_run_dir, variant)
     os.makedirs(sub_dir, exist_ok=True)
     RUN_DIR = sub_dir
 
-    # Reset seed and CUDA/torch state per variant so the second variant in a no-cal-then-cal run.
-    set_global_seed(GLOBAL_SEED, bool(SEED_DETERMINISTIC))
-    if not bool(SEED_DETERMINISTIC):
-        torch.backends.cudnn.benchmark = True
-    if hasattr(torch, "set_float32_matmul_precision"):
-        torch.set_float32_matmul_precision("high")
+    # Every variant starts from the same RNG / cuDNN state, whatever ran before it.
+    _reset_torch_state()
 
-    no_cal_spec = _NO_CAL_VARIANT_SPEC.get(variant)
-    if use_calibration:
-        model_name = "CalibrationUNet"
-        ckpt_basename = CHECKPOINT_BASENAME_CAL
-    elif no_cal_spec is not None:
-        model_name = no_cal_spec["model_name"]
-        ckpt_basename = no_cal_spec["checkpoint_basename"]
-    else:
-        model_name = "PlainUNet3LNoCal"
-        ckpt_basename = CHECKPOINT_BASENAME_NO_CAL
+    model_name = _VARIANT_MODELS[variant]["model_name"]
+    ckpt_basename = _VARIANT_MODELS[variant]["checkpoint_basename"]
 
     logging.info("=" * 72)
     logging.info(f"Variant: {variant} (model={model_name})")
     logging.info(f"Variant run directory: {sub_dir}")
     logging.info("=" * 72)
 
-    # Copy split_subjects.json from the shared parent dir into the variant subdir so each subdir.
+    # Copy split_subjects.json from the parent dir so each variant subdir is self-contained.
     if shared_split_json_path:
         dst_split_path = os.path.join(sub_dir, "split_subjects.json")
         if os.path.isfile(shared_split_json_path):
@@ -3041,22 +2036,11 @@ def _run_one_variant(*, variant, parent_run_dir, train_list, val_list, test_list
         cal_pairs_path = ""
         cal_summary_path = ""
 
-    # Persist a copy of processed manifest annotated with split labels and the data lists.
+    # Persist the manifest with split labels, and the data lists.
     if processed_manifest_df is not None:
-        manifest_run = processed_manifest_df.copy()
-        manifest_run["split"] = "unused"
-        target_paths = set(train_list) | set(val_list) | set(test_list)
-        manifest_run.loc[manifest_run["npz_path"].isin(train_list), "split"] = "train"
-        manifest_run.loc[manifest_run["npz_path"].isin(val_list), "split"] = "val"
-        manifest_run.loc[manifest_run["npz_path"].isin(test_list), "split"] = "test"
-        cal_only_paths = set()
-        for _tgt, _p in (window_cal_pairs or {}).items():
-            for k in ("cal_low_path", "cal_high_path"):
-                cp = _p.get(k)
-                if cp and cp not in target_paths:
-                    cal_only_paths.add(cp)
-        manifest_run.loc[manifest_run["npz_path"].isin(cal_only_paths), "split"] = "calibration"
-        manifest_run.to_csv(processed_manifest_path, index=False)
+        _label_manifest_split(
+            processed_manifest_df, train_list, val_list, test_list, window_cal_pairs
+        ).to_csv(processed_manifest_path, index=False)
 
     save_data_lists(data_lists_path, train_list, val_list, test_list)
 
@@ -3071,7 +2055,7 @@ def _run_one_variant(*, variant, parent_run_dir, train_list, val_list, test_list
             json.dump(payload, f, indent=2)
         logging.info(f"Saved calibration pairs to: {cal_pairs_path}")
 
-        # Copy the rich calibration summary from the shared parent dir (produced once.
+        # Copy the calibration summary produced once in the parent dir.
         if shared_cal_summary_path:
             if os.path.isfile(shared_cal_summary_path):
                 shutil.copy2(shared_cal_summary_path, cal_summary_path)
@@ -3081,28 +2065,13 @@ def _run_one_variant(*, variant, parent_run_dir, train_list, val_list, test_list
                     f"Shared calibration summary not found: {shared_cal_summary_path}"
                 )
 
-    # Synchronise calibration pair globals so downstream test/visualisation code reads the right.
-
-    # ABP normalization stats are computed once in main() using the FULL (pre-filter) train_list.
+    # ABP normalization stats were computed by the caller (per fold, or once in main()).
     save_abp_stats(abp_stats_path)
 
-    # Datasets / DataLoaders
-    if use_calibration:
-        train_dataset = CalibrationBPDataset(train_list, window_cal_pairs)
-        val_dataset = CalibrationBPDataset(val_list, window_cal_pairs)
-    else:
-        train_dataset = BloodPressureDataset(train_list)
-        val_dataset = BloodPressureDataset(val_list)
-    dl_kwargs = _make_dataloader_kwargs()
-    train_loader = DataLoader(train_dataset, shuffle=True, **dl_kwargs)
-    val_loader = DataLoader(val_dataset, shuffle=False, **dl_kwargs)
-
-    if use_calibration:
-        model = _build_calibration_unet(device)
-    elif no_cal_spec is not None:
-        model = no_cal_spec["train_builder"](device)
-    else:
-        model = _build_plain_unet_no_cal(device)
+    train_loader, val_loader = _make_loaders(
+        train_list, val_list, window_cal_pairs, use_calibration=use_calibration
+    )
+    model = _build_train_model(variant, device)
 
     logging.info(f"Start training {model_name}...")
     model = train_model(
@@ -3112,20 +2081,14 @@ def _run_one_variant(*, variant, parent_run_dir, train_list, val_list, test_list
     )
 
     # Reload best weights into a fresh, uncompiled model for evaluation.
-    if use_calibration:
-        eval_model = CalibrationUNet(input_channels=3, base_channels=BASE_CHANNELS).to(device)
-    elif no_cal_spec is not None:
-        eval_model = no_cal_spec["eval_factory"](device)
-    else:
-        eval_model = PlainUNet3LNoCal(input_channels=3, base_channels=BASE_CHANNELS,
-                                      use_signal_stats=bool(USE_SIGNAL_STATS)).to(device)
+    eval_model = _new_model(variant, device)
     if os.path.isfile(checkpoint_path):
         _safe_load(eval_model, checkpoint_path, device)
     else:
         eval_model.load_state_dict(getattr(model, "_orig_mod", model).state_dict())
     eval_model.eval()
 
-    # Per-master Residual Feature Adapter fine-tune (calibrated only) Performed on the uncompiled.
+    # Per-master residual adapter fine-tune (calibrated only), on the uncompiled eval model.
     adapter_cache = {}
     adapter_diag_by_key = {}
     adapters_path = ""
@@ -3226,7 +2189,7 @@ def _run_one_variant(*, variant, parent_run_dir, train_list, val_list, test_list
         per_master_adapters_path=adapters_path,
     )
 
-    # Leave the decoder on Identity so the next variant / fold starts from a clean slate and cannot.
+    # Leave the decoder adapter on Identity so the next variant / fold cannot inherit it.
     _reset_adapter(eval_model)
 
     return {
@@ -3420,7 +2383,7 @@ def _run_cross_n(*, n_values, full_train_list, full_val_list, full_test_list,
             output_summary_path=cal_summary_path,
         )
 
-        # Validation hooks (per the static-calibration spec): * cal pair invariance per (sid.
+        # Validation hooks: pairs invariant within each (sid, master), plus a random spot check.
         _validate_calibration_invariance_per_master(window_cal_pairs)
         _validate_calibration_pairs_random(window_cal_pairs, N, sample=20)
 
@@ -3437,89 +2400,47 @@ def _run_cross_n(*, n_values, full_train_list, full_val_list, full_test_list,
             f"test {n_before[2]}->{len(test_list)}"
         )
 
-        n_subj_train = _count_subjects(train_list)
-        n_subj_val = _count_subjects(val_list)
-        n_subj_test = _count_subjects(test_list)
-        n_master_train = _count_master_records(train_list)
-        n_master_val = _count_master_records(val_list)
-        n_master_test = _count_master_records(test_list)
+        counts = _split_counts(train_list, val_list, test_list)
         logging.info(
-            f"[N={N}] subjects: train={n_subj_train}, "
-            f"val={n_subj_val}, test={n_subj_test}"
+            f"[N={N}] subjects: train={counts['n_subj_train']}, "
+            f"val={counts['n_subj_val']}, test={counts['n_subj_test']}"
         )
         logging.info(
-            f"[N={N}] master_records: train={n_master_train}, "
-            f"val={n_master_val}, test={n_master_test}"
+            f"[N={N}] master_records: train={counts['n_master_train']}, "
+            f"val={counts['n_master_val']}, test={counts['n_master_test']}"
         )
-        n_usable_masters_total = sum(
-            1 for _ in {(p["sid"], p["master_record"])
-                        for p in window_cal_pairs.values()}
-        )
+        n_usable_masters_total = len({(p["sid"], p["master_record"])
+                                      for p in window_cal_pairs.values()})
         logging.info(
             f"[N={N}] usable master_records across train/val/test: "
             f"{n_usable_masters_total}; total target windows: "
             f"{len(window_cal_pairs)}"
         )
 
-        # Annotate manifest copy with split labels per N and re-install so the per-variant subdir.
+        # Label the manifest with this N's split and re-install it so the variant subdirs inherit it.
         processed_manifest_df = None
         if base_manifest is not None:
-            manifest_run = base_manifest.copy()
-            manifest_run["split"] = "unused"
-            target_paths = set(train_list) | set(val_list) | set(test_list)
-            manifest_run.loc[manifest_run["npz_path"].isin(train_list), "split"] = "train"
-            manifest_run.loc[manifest_run["npz_path"].isin(val_list), "split"] = "val"
-            manifest_run.loc[manifest_run["npz_path"].isin(test_list), "split"] = "test"
-            cal_only_paths = set()
-            for _tgt, _p in window_cal_pairs.items():
-                for k in ("cal_low_path", "cal_high_path"):
-                    cp = _p.get(k)
-                    if cp and cp not in target_paths:
-                        cal_only_paths.add(cp)
-            manifest_run.loc[manifest_run["npz_path"].isin(cal_only_paths),
-                             "split"] = "calibration"
-            manifest_run.to_csv(
-                os.path.join(parent_run_dir, "processed_manifest.csv"),
-                index=False,
+            processed_manifest_df = _label_manifest_split(
+                base_manifest, train_list, val_list, test_list, window_cal_pairs
             )
-            install_manifest(manifest_run)
-            processed_manifest_df = manifest_run
+            processed_manifest_df.to_csv(
+                os.path.join(parent_run_dir, "processed_manifest.csv"), index=False
+            )
+            install_manifest(processed_manifest_df)
 
         save_data_lists(os.path.join(parent_run_dir, "data_lists.json"),
                         train_list, val_list, test_list)
 
         # Run no-cal first then calibrated (or whatever variants resolved).
-        variant_results = []
-        for v in variants:
-            res = _run_one_variant(
-                variant=v,
-                parent_run_dir=parent_run_dir,
-                train_list=train_list, val_list=val_list, test_list=test_list,
-                window_cal_pairs=window_cal_pairs,
-                n_subj_train=n_subj_train, n_subj_val=n_subj_val,
-                n_subj_test=n_subj_test,
-                n_master_train=n_master_train, n_master_val=n_master_val,
-                n_master_test=n_master_test,
-                processed_manifest_df=processed_manifest_df,
-                device=device, test_mod=test_mod,
-                shared_cal_summary_path=cal_summary_path,
-                shared_split_json_path=per_n_split_path,
-            )
-            variant_results.append(res)
-
-        compare_csv = _save_compare_summary(parent_run_dir, variant_results)
-        try:
-            cross_rows.extend(pd.read_csv(compare_csv).to_dict("records"))
-        except Exception as e:
-            logging.warning(f"Failed to fold compare summary into cross-N: {e}")
-
-        try:
-            _plot_compare_bar(
-                variant_results, N=int(N),
-                out_path=os.path.join(parent_run_dir, "compare_bar.png"),
-            )
-        except Exception as e:
-            logging.warning(f"Per-N comparison plot failed: {e}")
+        cross_rows.extend(_run_variants(
+            variants, parent_run_dir=parent_run_dir, N=N,
+            train_list=train_list, val_list=val_list, test_list=test_list,
+            window_cal_pairs=window_cal_pairs, counts=counts,
+            processed_manifest_df=processed_manifest_df,
+            device=device, test_mod=test_mod,
+            cal_summary_path=cal_summary_path, split_json_path=per_n_split_path,
+            log_tag=f"N={N}",
+        ))
 
     # Cross-N artifacts
     if cross_rows:
@@ -3596,9 +2517,6 @@ def _save_cv_summary(cross_root, cv_rows):
 
 def _run_kfold_cv(*, n_values, cross_root, base_manifest, variants,
                   test_mod, device):
-    global learning_rate
-    global GLOBAL_ABP_MIN, GLOBAL_ABP_MAX
-
     if base_manifest is None:
         raise RuntimeError("K-fold CV requires an installed processed manifest.")
 
@@ -3673,10 +2591,10 @@ def _run_kfold_cv(*, n_values, cross_root, base_manifest, variants,
         save_abp_stats(os.path.join(fold_root, "abp_normalization_stats.json"))
 
         if int(USE_OPTUNA_LR_SEARCH) == 1 and int(OPTUNA_PER_FOLD) == 1:
-            learning_rate = _optuna_lr_for_fold(
+            _install_tuned_lr(*_optuna_lr_for_fold(
                 f_train, f_val, f_test, fold_idx=fold_idx,
                 out_dir=fold_root, device=device,
-            )
+            ))
             install_manifest(base_manifest.copy())
             compute_global_abp_stats(f_train)
 
@@ -3800,9 +2718,8 @@ def _kfold_check_npz_exist(flist, *, tag: str, sample: int):
 
 
 def run_kfold_bundle(*, device, test_mod):
-    global RUN_DIR, train_list, val_list, test_list
-    global GLOBAL_ABP_MIN, GLOBAL_ABP_MAX, CALIBRATION_WINDOW_COUNT
-    global _WINDOW_CAL_PAIRS, learning_rate
+    global RUN_DIR, train_list, val_list, test_list, CALIBRATION_WINDOW_COUNT
+    global _WINDOW_CAL_PAIRS
 
     variants = _resolve_compare_modes()
     need_cal = VARIANT_CALIBRATED in variants
@@ -3831,6 +2748,24 @@ def run_kfold_bundle(*, device, test_mod):
     logging.info(f"  run directory : {cross_root}")
     logging.info("=" * 72)
 
+    # One search on bundle fold OPTUNA_FOLD, then every fold trains with the result.
+    if int(USE_OPTUNA_LR_SEARCH) == 1 and int(OPTUNA_PER_FOLD) != 1:
+        fold_data = load_kfold_fold(int(OPTUNA_FOLD), npz_root, include_calibration=need_cal)
+        _kfold_check_npz_exist(fold_data["train_list"], tag=fold_data["fold"],
+                               sample=int(KFOLD_BUNDLE_NPZ_CHECK))
+        install_manifest(fold_data["manifest_df"].copy())
+        preprocess.set_abp_stats(fold_data["abp_min"], fold_data["abp_max"])
+        _WINDOW_CAL_PAIRS = fold_data["calibration_pairs"]
+        _install_tuned_lr(*_optuna_lr_for_fold(
+            fold_data["train_list"], fold_data["val_list"], fold_data["test_list"],
+            fold_idx=int(OPTUNA_FOLD), out_dir=cross_root, device=device,
+            window_cal_pairs=fold_data["calibration_pairs"],
+        ))
+        RUN_DIR = cross_root
+        if int(OPTUNA_THEN_KFOLD) != 1:
+            logging.info("OPTUNA_THEN_KFOLD=0 — stopping after the LR search.")
+            return
+
     all_rows: list = []
     for fold in KFOLD_BUNDLE_FOLDS:
         fold_data = load_kfold_fold(fold, npz_root, include_calibration=need_cal)
@@ -3838,8 +2773,7 @@ def run_kfold_bundle(*, device, test_mod):
 
         # Install this fold's manifest / calibration pairs / ABP stats as the module globals.
         install_manifest(fold_data["manifest_df"].copy())
-        GLOBAL_ABP_MIN = fold_data["abp_min"]
-        GLOBAL_ABP_MAX = fold_data["abp_max"]
+        preprocess.set_abp_stats(fold_data["abp_min"], fold_data["abp_max"])
         window_cal_pairs = fold_data["calibration_pairs"]
         _WINDOW_CAL_PAIRS = window_cal_pairs
 
@@ -3874,11 +2808,11 @@ def run_kfold_bundle(*, device, test_mod):
         cal_summary_path = fold_data["cal_summary_path"]
 
         if int(USE_OPTUNA_LR_SEARCH) == 1 and int(OPTUNA_PER_FOLD) == 1:
-            learning_rate = _optuna_lr_for_fold(
+            _install_tuned_lr(*_optuna_lr_for_fold(
                 train_list, val_list, test_list, fold_idx=fold,
                 out_dir=parent_run_dir, device=device,
                 window_cal_pairs=window_cal_pairs,
-            )
+            ))
 
         if need_cal and window_cal_pairs:
             with open(os.path.join(parent_run_dir,
@@ -3890,20 +2824,15 @@ def run_kfold_bundle(*, device, test_mod):
                     "pairs_by_target_path": window_cal_pairs,
                 }, f, indent=2)
 
-        n_subj_train = _count_subjects(train_list)
-        n_subj_val = _count_subjects(val_list)
-        n_subj_test = _count_subjects(test_list)
-        n_master_train = _count_master_records(train_list)
-        n_master_val = _count_master_records(val_list)
-        n_master_test = _count_master_records(test_list)
+        counts = _split_counts(train_list, val_list, test_list)
         logging.info("#" * 72)
         logging.info(f"### {fold_name} (from bundle) ###")
         logging.info(f"### windows: train={len(train_list)}, "
                      f"val={len(val_list)}, test={len(test_list)} ###")
-        logging.info(f"### subjects: train={n_subj_train}, "
-                     f"val={n_subj_val}, test={n_subj_test} ###")
-        logging.info(f"### master_records: train={n_master_train}, "
-                     f"val={n_master_val}, test={n_master_test} ###")
+        logging.info(f"### subjects: train={counts['n_subj_train']}, "
+                     f"val={counts['n_subj_val']}, test={counts['n_subj_test']} ###")
+        logging.info(f"### master_records: train={counts['n_master_train']}, "
+                     f"val={counts['n_master_val']}, test={counts['n_master_test']} ###")
         logging.info("#" * 72)
 
         processed_manifest_df = fold_data["manifest_df"].copy()
@@ -3913,38 +2842,16 @@ def run_kfold_bundle(*, device, test_mod):
         save_data_lists(os.path.join(parent_run_dir, "data_lists.json"),
                         train_list, val_list, test_list)
 
-        variant_results = []
-        for v in variants:
-            res = _run_one_variant(
-                variant=v,
-                parent_run_dir=parent_run_dir,
-                train_list=train_list, val_list=val_list, test_list=test_list,
-                window_cal_pairs=window_cal_pairs,
-                n_subj_train=n_subj_train, n_subj_val=n_subj_val,
-                n_subj_test=n_subj_test,
-                n_master_train=n_master_train, n_master_val=n_master_val,
-                n_master_test=n_master_test,
-                processed_manifest_df=processed_manifest_df,
-                device=device, test_mod=test_mod,
-                shared_cal_summary_path=cal_summary_path,
-                shared_split_json_path=per_n_split_path,
-            )
-            variant_results.append(res)
-
-        compare_csv = _save_compare_summary(parent_run_dir, variant_results)
-        try:
-            for row in pd.read_csv(compare_csv).to_dict("records"):
-                all_rows.append({"fold": fold_name, "N": int(N), **row})
-        except Exception as e:
-            logging.warning(f"[{fold_name}] compare summary fold-in failed: {e}")
-
-        try:
-            _plot_compare_bar(
-                variant_results, N=int(N),
-                out_path=os.path.join(parent_run_dir, "compare_bar.png"),
-            )
-        except Exception as e:
-            logging.warning(f"[{fold_name}] comparison plot failed: {e}")
+        for row in _run_variants(
+            variants, parent_run_dir=parent_run_dir, N=N,
+            train_list=train_list, val_list=val_list, test_list=test_list,
+            window_cal_pairs=window_cal_pairs, counts=counts,
+            processed_manifest_df=processed_manifest_df,
+            device=device, test_mod=test_mod,
+            cal_summary_path=cal_summary_path, split_json_path=per_n_split_path,
+            log_tag=fold_name,
+        ):
+            all_rows.append({"fold": fold_name, "N": int(N), **row})
 
     if all_rows:
         _save_cv_summary(cross_root, all_rows)
@@ -3954,9 +2861,17 @@ def run_kfold_bundle(*, device, test_mod):
 
 
 # Optuna LR search
+def _install_tuned_lr(best_lr, best_gate_lr):
+    global learning_rate, GATE_LEARNING_RATE
+    learning_rate = float(best_lr)
+    if best_gate_lr is not None:
+        GATE_LEARNING_RATE = float(best_gate_lr)
+    logging.info(f"Tuned learning rates installed: lr={learning_rate:.2e}"
+                 + (f", gate_lr={GATE_LEARNING_RATE:.2e}" if best_gate_lr is not None else ""))
+
+
 def run_optuna_lr_search(*, cross_root, base_manifest, device):
-    global RUN_DIR, train_list, val_list, test_list
-    global GLOBAL_ABP_MIN, GLOBAL_ABP_MAX, _WINDOW_CAL_PAIRS
+    global RUN_DIR, train_list, val_list, test_list, _WINDOW_CAL_PAIRS
 
     if base_manifest is None:
         raise RuntimeError("Optuna LR search requires an installed processed manifest.")
@@ -3997,6 +2912,7 @@ def run_optuna_lr_search(*, cross_root, base_manifest, device):
 
 
 # window_cal_pairs given (bundle mode) -> lists already filtered, nothing recomputed.
+# Returns (best_lr, best_gate_lr); best_gate_lr is None when the model has no gate learning rate.
 def _optuna_lr_for_fold(f_train, f_val, f_test, *, fold_idx, out_dir, device,
                         window_cal_pairs=None):
     global RUN_DIR, train_list, val_list, test_list, _WINDOW_CAL_PAIRS
@@ -4005,16 +2921,20 @@ def _optuna_lr_for_fold(f_train, f_val, f_test, *, fold_idx, out_dir, device,
 
     variant = _resolve_compare_modes()[0]
     use_calibration = (variant == VARIANT_CALIBRATED)
-    no_cal_spec = _NO_CAL_VARIANT_SPEC.get(variant)
     N = int(N_VALUES[0])
     run_dir = os.path.join(out_dir, "optuna_lr")
     os.makedirs(run_dir, exist_ok=True)
     prev_run_dir = RUN_DIR
     RUN_DIR = run_dir
 
+    joint = GATE_LEARNING_RATE is not None
     logging.info("=" * 72)
-    logging.info(f"OPTUNA LR SEARCH — fold {fold_idx}, {len(OPTUNA_LR_GRID)} rates, "
-                 f"{OPTUNA_EPOCHS} epochs each  [{variant}]")
+    if joint:
+        logging.info(f"OPTUNA (lr, gate_lr) SEARCH — fold {fold_idx}, {OPTUNA_N_TRIALS} TPE trials, "
+                     f"{OPTUNA_EPOCHS} epochs each  [{variant}]")
+    else:
+        logging.info(f"OPTUNA LR SEARCH — fold {fold_idx}, {len(OPTUNA_LR_GRID)} rates, "
+                     f"{OPTUNA_EPOCHS} epochs each  [{variant}]")
     logging.info("=" * 72)
 
     if window_cal_pairs is None:
@@ -4033,38 +2953,32 @@ def _optuna_lr_for_fold(f_train, f_val, f_test, *, fold_idx, out_dir, device,
                  f"val={len(val_list)}, test={len(test_list)}; "
                  f"cal_pairs={len(window_cal_pairs)}")
 
-    # loaders built ONCE: they do not depend on lr
-    if use_calibration:
-        train_dataset = CalibrationBPDataset(train_list, window_cal_pairs)
-        val_dataset = CalibrationBPDataset(val_list, window_cal_pairs)
-    else:
-        train_dataset = BloodPressureDataset(train_list)
-        val_dataset = BloodPressureDataset(val_list)
-    dl_kwargs = _make_dataloader_kwargs()
-    train_loader = DataLoader(train_dataset, shuffle=True, **dl_kwargs)
-    val_loader = DataLoader(val_dataset, shuffle=False, **dl_kwargs)
+    # Loaders are built once: they do not depend on lr.
+    train_loader, val_loader = _make_loaders(
+        train_list, val_list, window_cal_pairs, use_calibration=use_calibration
+    )
 
     scratch_ckpt = os.path.join(run_dir, "optuna_trial_scratch.pth")
     trial_rows: list = []
 
     def objective(trial):
-        lr = trial.suggest_categorical("lr", OPTUNA_LR_GRID)
-        # Fresh seed + fresh model per trial so lr is the ONLY thing varying.
-        set_global_seed(GLOBAL_SEED, bool(SEED_DETERMINISTIC))
-        if use_calibration:
-            model = _build_calibration_unet(device)
-        elif no_cal_spec is not None:
-            model = no_cal_spec["train_builder"](device)
+        if joint:
+            lr = trial.suggest_float("lr", *OPTUNA_LR_RANGE, log=True)
+            gate_lr = trial.suggest_float("gate_lr", *OPTUNA_GATE_LR_RANGE, log=True)
         else:
-            model = _build_plain_unet_no_cal(device)
-        logging.info(f"[trial {trial.number}] lr={lr:.2e} — "
-                     f"training {OPTUNA_EPOCHS} epochs")
+            lr = trial.suggest_categorical("lr", OPTUNA_LR_GRID)
+            gate_lr = None
+        tag = f"lr={lr:.2e}" + (f" gate_lr={gate_lr:.2e}" if joint else "")
+        # Fresh seed + fresh model per trial so the learning rates are the ONLY thing varying.
+        set_global_seed(GLOBAL_SEED, bool(SEED_DETERMINISTIC))
+        model = _build_train_model(variant, device)
+        logging.info(f"[trial {trial.number}] {tag} — training {OPTUNA_EPOCHS} epochs")
         _, best_val = train_model(
             model, train_loader, val_loader, OPTUNA_EPOCHS, device,
             scratch_ckpt, plot_curve=False,
             use_calibration=use_calibration,
-            history_title=f"Optuna trial {trial.number} lr={lr:.2e}",
-            lr=lr, return_best_val=True,
+            history_title=f"Optuna trial {trial.number} {tag}",
+            lr=lr, gate_lr=gate_lr, return_best_val=True,
         )
         del model
         try:
@@ -4073,16 +2987,22 @@ def _optuna_lr_for_fold(f_train, f_val, f_test, *, fold_idx, out_dir, device,
         except Exception:
             pass
         best_val = float(best_val)
-        trial_rows.append({"trial": int(trial.number), "lr": float(lr),
-                           "best_val_loss": best_val})
-        logging.info(f"[trial {trial.number}] lr={lr:.2e} -> "
-                     f"best_val_loss={best_val:.6f}")
+        row = {"trial": int(trial.number), "lr": float(lr), "best_val_loss": best_val}
+        if joint:
+            row["gate_lr"] = float(gate_lr)
+        trial_rows.append(row)
+        logging.info(f"[trial {trial.number}] {tag} -> best_val_loss={best_val:.6f}")
         return best_val
 
-    sampler = optuna.samplers.GridSampler({"lr": OPTUNA_LR_GRID})
+    if joint:
+        sampler = optuna.samplers.TPESampler(seed=int(OPTUNA_SEED))
+        n_trials = int(OPTUNA_N_TRIALS)
+    else:
+        sampler = optuna.samplers.GridSampler({"lr": OPTUNA_LR_GRID})
+        n_trials = len(OPTUNA_LR_GRID)
     study = optuna.create_study(direction="minimize", sampler=sampler,
-                                study_name=f"lr_grid_fold{fold_idx}")
-    study.optimize(objective, n_trials=len(OPTUNA_LR_GRID))
+                                study_name=f"lr_{'tpe' if joint else 'grid'}_fold{fold_idx}")
+    study.optimize(objective, n_trials=n_trials)
 
     results_df = pd.DataFrame(trial_rows).sort_values("lr").reset_index(drop=True)
     csv_path = os.path.join(run_dir, "optuna_lr_search.csv")
@@ -4090,55 +3010,66 @@ def _optuna_lr_for_fold(f_train, f_val, f_test, *, fold_idx, out_dir, device,
     logging.info(f"Saved Optuna LR results: {csv_path}")
 
     best_lr = float(study.best_trial.params["lr"])
+    best_gate_lr = float(study.best_trial.params["gate_lr"]) if joint else None
     with open(os.path.join(run_dir, "optuna_lr_search_best.json"), "w") as f:
         json.dump({
             "best_lr": best_lr,
+            "best_gate_lr": best_gate_lr,
             "best_val_loss": float(study.best_trial.value),
             "epochs_per_trial": int(OPTUNA_EPOCHS),
             "fold": fold_idx,
             "N": N,
             "variant": variant,
             "model": MODEL_NAME,
-            "lr_grid": [float(x) for x in OPTUNA_LR_GRID],
+            "search": ("tpe_joint" if joint else "lr_grid"),
+            "lr_grid": (None if joint else [float(x) for x in OPTUNA_LR_GRID]),
+            "lr_range": (list(OPTUNA_LR_RANGE) if joint else None),
+            "gate_lr_range": (list(OPTUNA_GATE_LR_RANGE) if joint else None),
             "all_trials": trial_rows,
         }, f, indent=2)
 
-    # Bar plot: lr -> best val loss (winner highlighted).
+    # Grid: one bar per lr. Joint: (lr, gate_lr) scatter coloured by loss. Winner highlighted.
     try:
         fig, ax = plt.subplots(figsize=(9, 5))
-        lrs = results_df["lr"].tolist()
-        colors = ["#d62728" if abs(v - best_lr) < 1e-12 else "#1f77b4" for v in lrs]
-        ax.bar([f"{v:.0e}" for v in lrs], results_df["best_val_loss"].tolist(),
-               color=colors)
-        ax.set_xlabel("learning rate")
-        ax.set_ylabel(f"best val loss ({OPTUNA_EPOCHS} epochs)")
+        if joint:
+            sc = ax.scatter(results_df["lr"], results_df["gate_lr"],
+                            c=results_df["best_val_loss"], cmap="viridis", s=60)
+            ax.scatter([best_lr], [best_gate_lr], s=200, facecolors="none",
+                       edgecolors="#d62728", linewidths=2)
+            ax.set_xscale("log")
+            ax.set_yscale("log")
+            ax.set_xlabel("backbone learning rate")
+            ax.set_ylabel("gate learning rate")
+            fig.colorbar(sc, ax=ax, label=f"best val loss ({OPTUNA_EPOCHS} epochs)")
+        else:
+            lrs = results_df["lr"].tolist()
+            colors = ["#d62728" if abs(v - best_lr) < 1e-12 else "#1f77b4" for v in lrs]
+            ax.bar([f"{v:.0e}" for v in lrs], results_df["best_val_loss"].tolist(),
+                   color=colors)
+            ax.set_xlabel("learning rate")
+            ax.set_ylabel(f"best val loss ({OPTUNA_EPOCHS} epochs)")
+            ax.grid(True, axis="y", linestyle="--", alpha=0.4)
         ax.set_title(f"Optuna LR search — {MODEL_NAME} [{variant}], fold {fold_idx}")
-        ax.grid(True, axis="y", linestyle="--", alpha=0.4)
         fig.tight_layout()
         fig.savefig(os.path.join(run_dir, "optuna_lr_search.png"), dpi=120)
         plt.close(fig)
     except Exception as e:
-        logging.warning(f"Optuna bar plot failed: {e}")
+        logging.warning(f"Optuna plot failed: {e}")
 
-    logging.info(f"[fold {fold_idx}] OPTUNA BEST lr = {best_lr:.2e} "
-                 f"(best_val_loss={study.best_trial.value:.6f})")
+    logging.info(f"[fold {fold_idx}] OPTUNA BEST lr = {best_lr:.2e}"
+                 + (f", gate_lr = {best_gate_lr:.2e}" if joint else "")
+                 + f" (best_val_loss={study.best_trial.value:.6f})")
     RUN_DIR = prev_run_dir
-    return best_lr
+    return best_lr, best_gate_lr
 
 
 # Entry point
 def main():
-    global RUN_DIR, train_list, val_list, test_list
-    global GLOBAL_ABP_MIN, GLOBAL_ABP_MAX, CALIBRATION_WINDOW_COUNT
-    global learning_rate
+    global RUN_DIR
 
     variants = _resolve_compare_modes()
 
-    set_global_seed(GLOBAL_SEED, bool(SEED_DETERMINISTIC))
-    if not bool(SEED_DETERMINISTIC):
-        torch.backends.cudnn.benchmark = True
-    if hasattr(torch, "set_float32_matmul_precision"):
-        torch.set_float32_matmul_precision("high")
+    _reset_torch_state()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -4172,24 +3103,27 @@ def main():
     shared_abp_stats_path = os.path.join(cross_root, "abp_normalization_stats.json")
 
     logging.info("Start data preprocessing (shared across N values and variants)...")
-    full_train_list, full_val_list, full_test_list = data_preprocessing(
-        shared_split_path, shared_manifest_path
+    full_train_list, full_val_list, full_test_list = preprocess.data_preprocessing(
+        shared_split_path, shared_manifest_path,
+        force_rebuild=FORCE_REBUILD_PROCESSED, data_usage_ratio=data_usage_ratio,
+        ratios=(train_ratio, val_ratio, test_ratio),
+        summary_csv_path=SUBJECT_FILE_MAP_OUTPUT_PATH,
+        min_windows=CALIBRATION_WINDOW_COUNT,
     )
 
-    base_manifest = (_PROCESSED_MANIFEST.copy()
-                     if _PROCESSED_MANIFEST is not None else None)
+    manifest = preprocess.manifest()
+    base_manifest = manifest.copy() if manifest is not None else None
 
-    # Optional fixed-grid LR search before the real run.
+    # Optional LR search on one fold before the real run.
     if int(USE_OPTUNA_LR_SEARCH) == 1 and int(OPTUNA_PER_FOLD) != 1:
-        best_lr = run_optuna_lr_search(
+        tuned = run_optuna_lr_search(
             cross_root=cross_root, base_manifest=base_manifest, device=device,
         )
         if int(OPTUNA_THEN_KFOLD) != 1:
             logging.info("OPTUNA_THEN_KFOLD=0 — stopping after the LR search.")
             return
-        learning_rate = float(best_lr)
+        _install_tuned_lr(*tuned)
         RUN_DIR = cross_root
-        logging.info(f"Continuing the full run with lr={learning_rate:.2e}")
 
     if USE_KFOLD:
         # Subject-wise stratified k-fold; ABP stats recomputed per fold.

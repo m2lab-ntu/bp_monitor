@@ -2,8 +2,6 @@ import os
 import json
 import logging
 import math
-from datetime import datetime
-from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -19,7 +17,7 @@ import joblib
 import torch
 
 import train as train_mod
-from models import CalibrationUNet, PlainUNet3LNoCal
+import preprocess
 
 
 # Calibration context loading and forward
@@ -41,10 +39,10 @@ def _load_cal_context_tensors(filepath, device):
             f"_load_cal_context_tensors."
         )
 
-    X_c1, _, _, _ = train_mod.load_segment(cal_low_path)
-    X_c1, _ = train_mod.normalize_ppg_ecg_segment(X_c1)
-    X_c2, _, _, _ = train_mod.load_segment(cal_high_path)
-    X_c2, _ = train_mod.normalize_ppg_ecg_segment(X_c2)
+    X_c1, _, _, _ = preprocess.load_segment(cal_low_path)
+    X_c1, _ = preprocess.normalize_ppg_ecg_segment(X_c1)
+    X_c2, _, _, _ = preprocess.load_segment(cal_high_path)
+    X_c2, _ = preprocess.normalize_ppg_ecg_segment(X_c2)
 
     x_cal1 = torch.FloatTensor(X_c1).transpose(0, 1).unsqueeze(0).to(device)
     x_cal2 = torch.FloatTensor(X_c2).transpose(0, 1).unsqueeze(0).to(device)
@@ -86,27 +84,6 @@ def _enforce_static_first_n_mode(cal_pairs_path: str):
     )
 
 
-def setup_logging(prefix="test"):
-    log_dir = "logs"
-    os.makedirs(log_dir, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    log_file = os.path.join(log_dir, f"{prefix}_{ts}.log")
-    logger = logging.getLogger()
-    logger.setLevel(logging.INFO)
-    logger.handlers.clear()
-    fmt = logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s",
-                            datefmt="%Y-%m-%d %H:%M:%S")
-    sh = logging.StreamHandler()
-    sh.setLevel(logging.INFO)
-    sh.setFormatter(fmt)
-    logger.addHandler(sh)
-    fh = logging.FileHandler(log_file, encoding="utf-8")
-    fh.setLevel(logging.INFO)
-    fh.setFormatter(fmt)
-    logger.addHandler(fh)
-    logging.info(f"Logging to file: {log_file}")
-
-
 def calc_ME_SD(t, p):
     e = p - t
     n = e.size if hasattr(e, 'size') else len(e)
@@ -128,10 +105,10 @@ def test_model(model, test_list, device, *, use_calibration: bool = True):
 
     with torch.no_grad():
         for fp in tqdm(test_list, desc="Testing"):
-            X, Y, _, _ = train_mod.load_segment(fp)
+            X, Y, _, _ = preprocess.load_segment(fp)
             if X is None or Y is None:
                 continue
-            X_norm, stats = train_mod.normalize_ppg_ecg_segment(X)
+            X_norm, stats = preprocess.normalize_ppg_ecg_segment(X)
             X_tensor = torch.FloatTensor(X_norm).transpose(0, 1).unsqueeze(0).to(device)
             stats_tensor = (torch.FloatTensor(stats).unsqueeze(0).to(device)
                             if train_mod.USE_SIGNAL_STATS else None)
@@ -142,7 +119,7 @@ def test_model(model, test_list, device, *, use_calibration: bool = True):
             )
             wave_pred_norm, _, _ = train_mod._unpack_model_output(out_all)
             pred_norm = wave_pred_norm.cpu().numpy().ravel()
-            pred = train_mod.denormalize_abp(pred_norm)
+            pred = preprocess.denormalize_abp(pred_norm)
 
             # Waveform per-segment metrics
             mae = float(mean_absolute_error(Y, pred))
@@ -150,13 +127,13 @@ def test_model(model, test_list, device, *, use_calibration: bool = True):
             R = (float(np.corrcoef(Y, pred)[0, 1])
                  if (np.std(Y) >= 1e-8 and np.std(pred) >= 1e-8) else 0.0)
 
-            sbp_t, dbp_t, _ = train_mod._segment_bp_means_from_wave(Y)
-            sbp_p, dbp_p, _ = train_mod._segment_bp_means_from_wave(pred)
+            sbp_t, dbp_t, _ = preprocess.segment_bp_means_from_wave(Y)
+            sbp_p, dbp_p, _ = preprocess.segment_bp_means_from_wave(pred)
             sbp_err = (sbp_p - sbp_t) if (np.isfinite(sbp_t) and np.isfinite(sbp_p)) else float('nan')
             dbp_err = (dbp_p - dbp_t) if (np.isfinite(dbp_t) and np.isfinite(dbp_p)) else float('nan')
 
-            meta = train_mod._PATH_TO_META.get(fp, {})
-            sid = meta.get("sid", train_mod._get_sid_from_path(fp))
+            meta = (preprocess.meta_for(fp) or {})
+            sid = meta.get("sid", preprocess.get_sid_from_path(fp))
             master = meta.get("master_record", "")
             sw_idx = int(meta.get("subject_window_index", -1))
             rec_idx = int(meta.get("record_window_index", -1))
@@ -207,7 +184,7 @@ def test_model(model, test_list, device, *, use_calibration: bool = True):
                 d_samp = -1
                 d_time_min = float('nan')
 
-            # "Time from master start to target" — independent of which calibration mode picks the (cal_low.
+            # Time from master start to target; independent of which calibration mode picked the pair.
             target_time_from_master_start_minutes = (
                 rec_idx * train_mod.SEGMENT_LEN / train_mod.FS / 60.0
                 if rec_idx >= 0 else float('nan')
@@ -356,12 +333,12 @@ def _collect_decoder_embeddings(file_list, model, device, desc_tag="train",
 
     with torch.no_grad():
         for fp in tqdm(file_list, desc=f"Extracting decoder embeddings ({desc_tag})"):
-            X, Y, _, _ = train_mod.load_segment(fp)
+            X, Y, _, _ = preprocess.load_segment(fp)
             if X is None or Y is None:
                 skipped += 1
                 continue
-            X_norm, stats = train_mod.normalize_ppg_ecg_segment(X)
-            sbp_m_t, dbp_m_t, _ = train_mod._segment_bp_means_from_wave(Y)
+            X_norm, stats = preprocess.normalize_ppg_ecg_segment(X)
+            sbp_m_t, dbp_m_t, _ = preprocess.segment_bp_means_from_wave(Y)
             if not (np.isfinite(sbp_m_t) and np.isfinite(dbp_m_t)):
                 skipped += 1
                 continue
@@ -870,7 +847,7 @@ def run_calibration_distance_analysis(run_dir):
         default_width=5.0,
     )
 
-    # (c) Fine-grained minute-resolution view up to 1 hour (5-minute bins.
+    # (c) Fine-grained view up to 1 hour (5-minute bins).
     fine_minute_edges = list(np.arange(0.0, 60.0 + 1e-9, 5.0))
     _calibration_distance_analysis_one(
         df, run_dir,
@@ -965,10 +942,10 @@ def evaluate_segment_level_predictions(model, file_list, device,
     model.eval()
     with torch.no_grad():
         for fp in tqdm(file_list, desc="Post-train: collect segment-level SBP/DBP/ABP"):
-            X, Y, _, _ = train_mod.load_segment(fp)
+            X, Y, _, _ = preprocess.load_segment(fp)
             if X is None:
                 continue
-            X_norm, stats = train_mod.normalize_ppg_ecg_segment(X)
+            X_norm, stats = preprocess.normalize_ppg_ecg_segment(X)
             x_tensor = torch.FloatTensor(X_norm).transpose(0, 1).unsqueeze(0).to(device)
             stats_tensor = (torch.FloatTensor(stats).unsqueeze(0).to(device)
                             if train_mod.USE_SIGNAL_STATS else None)
@@ -979,10 +956,10 @@ def evaluate_segment_level_predictions(model, file_list, device,
             )
             pred_norm, _, _ = train_mod._unpack_model_output(out_all)
             pred_norm = pred_norm.cpu().numpy().ravel()
-            pred = train_mod.denormalize_abp(pred_norm)
+            pred = preprocess.denormalize_abp(pred_norm)
 
-            s_m, d_m, a_m = train_mod._segment_bp_means_from_wave(Y)
-            s_pm, d_pm, a_pm = train_mod._segment_bp_means_from_wave(pred)
+            s_m, d_m, a_m = preprocess.segment_bp_means_from_wave(Y)
+            s_pm, d_pm, a_pm = preprocess.segment_bp_means_from_wave(pred)
             if np.isfinite(s_m) and np.isfinite(s_pm):
                 sbp_t.append(s_m); sbp_p.append(s_pm)
             if np.isfinite(d_m) and np.isfinite(d_pm):
@@ -1111,10 +1088,10 @@ def visualize_results(model, test_list, device, num_samples=3,
     with torch.no_grad():
         for i, idx in enumerate(sample_indices):
             fp = test_list[int(idx)]
-            X, Y, _, _ = train_mod.load_segment(fp)
+            X, Y, _, _ = preprocess.load_segment(fp)
             if X is None:
                 continue
-            X_norm, stats = train_mod.normalize_ppg_ecg_segment(X)
+            X_norm, stats = preprocess.normalize_ppg_ecg_segment(X)
             X_tensor = torch.FloatTensor(X_norm).transpose(0, 1).unsqueeze(0).to(device)
             stats_tensor = (torch.FloatTensor(stats).unsqueeze(0).to(device)
                             if train_mod.USE_SIGNAL_STATS else None)
@@ -1124,7 +1101,7 @@ def visualize_results(model, test_list, device, num_samples=3,
             )
             pred_norm, _, _ = train_mod._unpack_model_output(out_all)
             pred_norm = pred_norm.cpu().numpy().ravel()
-            pred_sig = train_mod.denormalize_abp(pred_norm)
+            pred_sig = preprocess.denormalize_abp(pred_norm)
 
             plt.figure(figsize=(15, 5))
             plt.plot(Y, label="True ABP", alpha=0.8, linewidth=1)
@@ -1155,7 +1132,7 @@ def main_test_only():
         torch.set_float32_matmul_precision("high")
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    setup_logging(prefix="test")
+    train_mod.setup_logging(prefix="test")
     logging.info(f"Using device: {device}")
     logging.info(f"Test-only run directory: {run_dir}")
     logging.info(
@@ -1182,10 +1159,10 @@ def main_test_only():
 
     # Load processed manifest (mandatory)
     manifest_path = os.path.join(run_dir, "processed_manifest.csv")
-    df_manifest = train_mod.load_processed_manifest(manifest_path)
+    df_manifest = preprocess.load_processed_manifest(manifest_path)
     if df_manifest is None:
         raise RuntimeError(f"processed_manifest.csv not found in {run_dir}")
-    train_mod.install_manifest(df_manifest)
+    preprocess.install_manifest(df_manifest)
 
     # Load data lists (exact paths/order)
     data_lists_path = os.path.join(run_dir, "data_lists.json")
@@ -1236,48 +1213,19 @@ def main_test_only():
 
     # Load normalization stats (mandatory)
     abp_stats_path = os.path.join(run_dir, "abp_normalization_stats.json")
-    if not train_mod._load_saved_norm_stats(abp_stats_path):
+    if not preprocess.load_saved_norm_stats(abp_stats_path):
         raise RuntimeError(f"Cannot load ABP normalization stats from {abp_stats_path}")
 
-    # Build & load model (variant-aware).
-    _no_cal_dispatch = {
-        "PlainUNet3LNoCal": (PlainUNet3LNoCal,
-                             train_mod.CHECKPOINT_BASENAME_NO_CAL, {}),
-    }
-    for _vn, _vs in train_mod._NO_CAL_VARIANT_SPEC.items():
-        # Only register baselines whose class exists in the selected models/*.py.
-        _cls = getattr(train_mod.model_lib, _vs["class_name"], None)
-        if _cls is not None:
-            _no_cal_dispatch[_vs["model_name"]] = (
-                _cls, _vs["checkpoint_basename"], _vs.get("extra_kwargs", {}),
-            )
-
-    if use_calibration:
-        model = CalibrationUNet(
-            input_channels=3, base_channels=train_mod.BASE_CHANNELS
-        ).to(device)
-        ckpt_basename = train_mod.CHECKPOINT_BASENAME_CAL
-    else:
-        if model_name in _no_cal_dispatch:
-            cls, ckpt_basename, extra_kwargs = _no_cal_dispatch[model_name]
-        else:
-            cls = PlainUNet3LNoCal
-            ckpt_basename = train_mod.CHECKPOINT_BASENAME_NO_CAL
-            extra_kwargs = {}
-        model = cls(
-            input_channels=3, base_channels=train_mod.BASE_CHANNELS,
-            use_signal_stats=bool(train_mod.USE_SIGNAL_STATS),
-            **extra_kwargs,
-        ).to(device)
-
-    ckpt_path = os.path.join(run_dir, ckpt_basename)
+    # Build the model the run manifest names and load its checkpoint.
+    model_variant = train_mod._variant_for_model_name(
+        model_name, use_calibration=use_calibration
+    )
+    model = train_mod._new_model(model_variant, device)
+    ckpt_path = os.path.join(
+        run_dir, train_mod._VARIANT_MODELS[model_variant]["checkpoint_basename"]
+    )
     if not os.path.isfile(ckpt_path):
-        # Tolerate older runs that used the legacy CHECKPOINT_BASENAME.
-        legacy_ckpt = os.path.join(run_dir, train_mod.CHECKPOINT_BASENAME)
-        if os.path.isfile(legacy_ckpt):
-            ckpt_path = legacy_ckpt
-        else:
-            raise RuntimeError(f"Checkpoint not found: {ckpt_path}")
+        raise RuntimeError(f"Checkpoint not found: {ckpt_path}")
     train_mod._safe_load(model, ckpt_path, device)
 
     # Load per-master Residual Feature Adapter cache (calibrated only).
