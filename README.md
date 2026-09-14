@@ -11,6 +11,7 @@ A two-stage, cuff-less blood-pressure estimation pipeline using PPG and ECG sign
 | Path / File            | Purpose |
 |------------------------|---------|
 | `pre_train.py`         | Converts raw *WFDB* `.dat` files to cleaned CSV (PPG, ECG, dPPG, ABP). |
+| `preprocess.py`        | CSV to NPZ segments, processed manifest, subject splits, segment loading. Driven by `train.py`. |
 | `models/`              | Model architectures and the registry. |
 | `train.py`             | End-to-end preprocessing, k-fold split, per-master adapter fine-tune, Optuna LR search, model training. |
 | `test.py`              | Evaluation. |
