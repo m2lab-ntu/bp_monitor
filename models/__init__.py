@@ -27,7 +27,7 @@ _RIDGE_GRID = (0.1, 1.0, 10.0, 100.0, 1000.0)
 
 # Architecture families, one module each. Keys that share a module differ only in module_config.
 CAL = "unet_cal"                      # CalibrationUNet with a switchable skip refiner
-NOCAL_SKIP = "unet_nocal_skip"        # no-cal U-Net, Mamba / Transformer / Conformer gates on the skips
+NOCAL_SKIP = "unet_nocal_skip"        # no-cal U-Net, Mamba / Transformer / ConvTransformer gates on the skips
 NOCAL_DECODER = "unet_nocal_decoder"  # no-cal U-Net, Mamba / Transformer refiners inside the decoder
 
 

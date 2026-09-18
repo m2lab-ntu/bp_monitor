@@ -135,11 +135,11 @@ MODEL_NAME = MODEL_SPEC.key
 GATE_LEARNING_RATE = MODEL_SPEC.gate_learning_rate
 
 # Deep-skip gate of the skip-refiner family (unet_mamba_skip / unet_transformer_skip):
-# 0 = Transformer, 1 = Conformer.
-USE_CONFORMER_GATE = 0
+# 0 = Transformer, 1 = ConvTransformer.
+USE_CONV_TRANSFORMER_GATE = 0
 
-_MODULE_HAS_GATE_SWITCH = hasattr(model_lib, "USE_CONFORMER_GATE")
-_GATE_KWARGS = ({"use_conformer_gate": int(USE_CONFORMER_GATE)}
+_MODULE_HAS_GATE_SWITCH = hasattr(model_lib, "USE_CONV_TRANSFORMER_GATE")
+_GATE_KWARGS = ({"use_conv_transformer_gate": int(USE_CONV_TRANSFORMER_GATE)}
                 if _MODULE_HAS_GATE_SWITCH else {})
 
 # Sync model module configuration
@@ -1703,8 +1703,8 @@ def save_run_manifest(path, *, run_dir, checkpoint_path, calibration_pairs_path,
         "USE_PER_MASTER_ADAPTER": bool(USE_PER_MASTER_ADAPTER),
         "ADAPTER_FT_OBJECTIVE": ADAPTER_FT_OBJECTIVE or "",
         "NO_CAL_BASELINES": list(NO_CAL_BASELINES),
-        "USE_CONFORMER_GATE": (int(USE_CONFORMER_GATE)
-                               if _MODULE_HAS_GATE_SWITCH else None),
+        "USE_CONV_TRANSFORMER_GATE": (int(USE_CONV_TRANSFORMER_GATE)
+                                      if _MODULE_HAS_GATE_SWITCH else None),
         "per_master_adapters_path": str(per_master_adapters_path or ""),
         "USE_MULTITASK_SBP_DBP": bool(USE_MULTITASK_SBP_DBP),
         "MT_SBP_LOSS_WEIGHT": float(MT_SBP_LOSS_WEIGHT),

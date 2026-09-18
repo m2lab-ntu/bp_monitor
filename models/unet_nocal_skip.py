@@ -1,5 +1,5 @@
 # No-calibration U-Net with decoder-gated refiners on the two deep skips:
-# a Mamba gate or a Transformer gate.
+# a Mamba gate (MambaUNet3LNoCal) or a Transformer / ConvTransformer gate (TransformerUNet3LNoCal).
 import math
 from typing import Optional
 
@@ -22,8 +22,8 @@ SKIP_REFINER_INIT_ALPHA_BIAS = -3.0  # the registry sets -4.0 for unet_mamba_ski
 # When False, the shallowest (highest-resolution, L=1024) U-Net skip is passed through.
 SKIP_REFINER_USE_SHALLOW_SKIP = False
 
-# Deep-skip gate: 0 = Transformer, 1 = Conformer.
-USE_CONFORMER_GATE = 0
+# Deep-skip gate: 0 = Transformer, 1 = ConvTransformer.
+USE_CONV_TRANSFORMER_GATE = 0
 
 
 # Bi-directional Mamba Attention Gate with additive residual refinement.
@@ -322,8 +322,8 @@ class PooledTransformerAttentionGate(nn.Module):
         return skip + alpha * v
 
 
-# Conformer block adapted for 1D BP-waveform skip refinement.
-class ConformerBlock1D(nn.Module):
+# ConvTransformer block adapted for 1D BP-waveform skip refinement.
+class ConvTransformerBlock1D(nn.Module):
 
     def __init__(self, d_model: int, n_heads: int = 4, ff_mult: int = 4,
                  conv_kernel: int = 31, dropout: float = DROPOUT_P):
@@ -381,8 +381,8 @@ class ConformerBlock1D(nn.Module):
         return self.norm_final(x)
 
 
-# Conformer-based decoder-gated skip refiner with additive residual.
-class ConformerAttentionGate(nn.Module):
+# ConvTransformer-based decoder-gated skip refiner with additive residual.
+class ConvTransformerAttentionGate(nn.Module):
 
     def __init__(self, c_skip: int, c_gate: int, c_inter: Optional[int] = None,
                  n_heads: int = 4, n_layers: int = 2, ff_mult: int = 4,
@@ -411,7 +411,7 @@ class ConformerAttentionGate(nn.Module):
         self.pos_enc = SinusoidalPositionalEncoding1D(c_inter)
 
         self.blocks = nn.ModuleList([
-            ConformerBlock1D(
+            ConvTransformerBlock1D(
                 d_model=c_inter, n_heads=n_heads, ff_mult=ff_mult,
                 conv_kernel=conv_kernel, dropout=dropout,
             )
@@ -535,7 +535,7 @@ class MambaSkipDecoder3LNoCal(nn.Module):
         return x, out.squeeze(1)
 
 
-# 3-level UNet decoder; deep skips go through the gate USE_CONFORMER_GATE selects.
+# 3-level UNet decoder; deep skips go through the gate USE_CONV_TRANSFORMER_GATE selects.
 class TransformerSkipDecoder3LNoCal(nn.Module):
 
     def __init__(self, base_channels: int = BASE_CHANNELS,
@@ -543,30 +543,30 @@ class TransformerSkipDecoder3LNoCal(nn.Module):
                  conv_kernel: int = 31,
                  ag0_pool_factor: int = 4,
                  use_shallow_skip: Optional[bool] = None,
-                 use_conformer_gate: Optional[int] = None):
+                 use_conv_transformer_gate: Optional[int] = None):
         super().__init__()
         if use_shallow_skip is None:
             use_shallow_skip = bool(SKIP_REFINER_USE_SHALLOW_SKIP)
         self.use_shallow_skip = bool(use_shallow_skip)
 
-        if use_conformer_gate is None:
-            use_conformer_gate = USE_CONFORMER_GATE
-        if int(use_conformer_gate) not in (0, 1):
+        if use_conv_transformer_gate is None:
+            use_conv_transformer_gate = USE_CONV_TRANSFORMER_GATE
+        if int(use_conv_transformer_gate) not in (0, 1):
             raise ValueError(
-                f"use_conformer_gate must be 1 (Conformer gate) or 0 "
-                f"(plain Transformer gate), got {use_conformer_gate!r}."
+                f"use_conv_transformer_gate must be 1 (ConvTransformer gate) or 0 "
+                f"(plain Transformer gate), got {use_conv_transformer_gate!r}."
             )
-        self.use_conformer_gate = int(use_conformer_gate)
+        self.use_conv_transformer_gate = int(use_conv_transformer_gate)
 
         # Deep skips (L=256, L=512).
-        if self.use_conformer_gate == 1:
-            self.ag2 = ConformerAttentionGate(
+        if self.use_conv_transformer_gate == 1:
+            self.ag2 = ConvTransformerAttentionGate(
                 c_skip=base_channels * 2, c_gate=base_channels * 4,
                 c_inter=base_channels,
                 n_heads=n_heads, n_layers=n_layers, ff_mult=ff_mult,
                 conv_kernel=conv_kernel,
             )
-            self.ag1 = ConformerAttentionGate(
+            self.ag1 = ConvTransformerAttentionGate(
                 c_skip=base_channels, c_gate=base_channels * 2,
                 c_inter=max(base_channels // 2, 8),
                 n_heads=max(1, n_heads // 2), n_layers=n_layers, ff_mult=ff_mult,
@@ -655,13 +655,13 @@ class MambaUNet3LNoCal(PlainUNet3LNoCal):
 
 
 class TransformerUNet3LNoCal(PlainUNet3LNoCal):
-    """No-calibration UNet with decoder-gated skip refiners (see USE_CONFORMER_GATE)."""
+    """No-calibration UNet with decoder-gated skip refiners (see USE_CONV_TRANSFORMER_GATE)."""
     def __init__(self, input_channels: int = 3,
                  base_channels: int = BASE_CHANNELS,
                  use_signal_stats: bool = True,
                  n_heads: int = 4, n_layers: int = 2, ff_mult: int = 4,
                  conv_kernel: int = 31,
-                 use_conformer_gate: Optional[int] = None):
+                 use_conv_transformer_gate: Optional[int] = None):
         super().__init__(input_channels=input_channels,
                          base_channels=base_channels,
                          use_signal_stats=use_signal_stats)
@@ -669,5 +669,5 @@ class TransformerUNet3LNoCal(PlainUNet3LNoCal):
             base_channels=base_channels,
             n_heads=n_heads, n_layers=n_layers, ff_mult=ff_mult,
             conv_kernel=conv_kernel,
-            use_conformer_gate=use_conformer_gate,
+            use_conv_transformer_gate=use_conv_transformer_gate,
         )
