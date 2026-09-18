@@ -1,4 +1,4 @@
-# No-calibration U-Net with refiners inside the decoder path (not on the skips):
+# No-calibration U-Net with refiners inside the decoder path:
 # Mamba or Transformer.
 import math
 from typing import Optional
