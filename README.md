@@ -1,6 +1,6 @@
 # bp_monitor
 
-**Blood Pressure Estimation**
+**Blood Pressure Estimation with Personalized Calibration**
 
 A two-stage, cuff-less blood-pressure estimation pipeline using PPG and ECG signals. The workflow converts raw waveforms into fixed-length segments, performs subject-wise stratified data splitting, and trains a U-Net model to reconstruct the ABP waveform.
 
