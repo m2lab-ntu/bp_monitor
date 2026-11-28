@@ -179,6 +179,11 @@ CALIBRATION_POOL_JUST_BEFORE_FIRST_TARGET = True
 
 CALIBRATION_MAX_GAP_MINUTES = 1440.0
 
+# Clocks: "real" or "cumulative"; late targets: "drop_late" or "shift_pool".
+CALIBRATION_TIME_MODE = "real"
+CALIBRATION_GAP_POLICY = "drop_late"
+CALIBRATION_POOL_TIME_MODE = "real"
+
 # Variants a run trains, and their checkpoint files
 NO_CAL_BASELINES = tuple(MODEL_SPEC.no_cal_baselines)
 
@@ -384,6 +389,15 @@ def select_calibration_pairs(file_list, output_pairs_path: Optional[str] = None,
     max_gap_minutes = float(CALIBRATION_MAX_GAP_MINUTES)
     max_gap_windows = (int(math.ceil(max_gap_minutes * 60.0 * FS / SEGMENT_LEN))
                        if just_before_target and max_gap_minutes > 0 else None)
+    time_mode = str(CALIBRATION_TIME_MODE).lower()
+    gap_policy = str(CALIBRATION_GAP_POLICY).lower()
+    pool_time_mode = str(CALIBRATION_POOL_TIME_MODE).lower()
+    if (time_mode not in ("real", "cumulative") or gap_policy not in ("shift_pool", "drop_late")
+            or pool_time_mode not in ("real", "cumulative")):
+        raise ValueError(f"Unknown CALIBRATION_TIME_MODE={CALIBRATION_TIME_MODE!r}, "
+                         f"CALIBRATION_GAP_POLICY={CALIBRATION_GAP_POLICY!r} "
+                         f"or CALIBRATION_POOL_TIME_MODE={CALIBRATION_POOL_TIME_MODE!r}")
+    gap_limit = max_gap_minutes * 60.0 * FS if time_mode == "real" else max_gap_windows
     desc_tag = (f"per-master fixed-{N} just-before-target "
                 f"(gap<={max_gap_minutes:g}min)"
                 if just_before_target else f"per-master static first-{N}")
@@ -403,17 +417,27 @@ def select_calibration_pairs(file_list, output_pairs_path: Optional[str] = None,
                        .reset_index(drop=True))
             n_total = len(rows)
 
+            raw = rows["raw_start_idx"].to_numpy(np.int64)
+            if (pool_time_mode == "real" or (max_gap_windows is not None and time_mode == "real")) \
+                    and (raw < 0).any():
+                raise ValueError(f"Missing raw_start_idx (sid={sid}, master={master}); "
+                                 f"use the 'cumulative' modes.")
+            n_pool0 = (int(np.searchsorted(raw + SEGMENT_LEN, raw[0] + N * SEGMENT_LEN, side="right"))
+                       if pool_time_mode == "real" else N)
+
             # Master too short → unusable: no calibration pair, no targets.
-            if n_total <= N:
+            if n_total <= n_pool0:
                 n_master_skipped_too_short += 1
                 continue
+
+            clock = raw if time_mode == "real" else np.arange(n_total)
 
             # Decide pool start position per master; static first-N means pool_start = 0.
             pool_start = 0
             n_dropped_this_master = 0
             if just_before_target:
                 eligible_indices: list = []
-                for i in range(N, n_total):
+                for i in range(n_pool0, n_total):
                     target_path = str(rows.loc[i, "npz_path"])
                     if (eligible_target_set is None
                             or target_path in eligible_target_set):
@@ -427,10 +451,13 @@ def select_calibration_pairs(file_list, output_pairs_path: Optional[str] = None,
                 t_min = int(rows.loc[t_min_idx, "record_window_index"])
                 t_max = int(rows.loc[t_max_idx, "record_window_index"])
 
-                if max_gap_windows is None:
+                if max_gap_windows is None or gap_policy == "drop_late":
                     pool_end_rwi = t_min
-                else:
+                elif time_mode == "cumulative":
                     pool_end_rwi = max(t_min, t_max - max_gap_windows + 1)
+                else:
+                    fits = clock[t_max_idx] - clock[:t_max_idx + 1] <= gap_limit
+                    pool_end_rwi = max(t_min, int(np.argmax(fits)) + 1)
                 if pool_end_rwi > t_min:
                     n_master_gap_triggered_shift += 1
                     n_dropped_this_master = sum(
@@ -438,8 +465,12 @@ def select_calibration_pairs(file_list, output_pairs_path: Optional[str] = None,
                         if int(rows.loc[i, "record_window_index"]) < pool_end_rwi
                     )
                     n_targets_dropped_by_gap += n_dropped_this_master
+                if pool_end_rwi > t_max:
+                    n_master_skipped_too_short += 1
+                    continue
 
-                pool_start = pool_end_rwi - N
+                pool_start = (int(np.searchsorted(raw, raw[pool_end_rwi - 1] + SEGMENT_LEN - N * SEGMENT_LEN))
+                              if pool_time_mode == "real" else pool_end_rwi - N)
                 # Safety: index lookup uses sorted-rows position, which equals rwi for the canonical master.
                 if pool_start < 0:
                     raise RuntimeError(
@@ -448,7 +479,7 @@ def select_calibration_pairs(file_list, output_pairs_path: Optional[str] = None,
                         f"non-contiguous rwis or a bug in placement."
                     )
 
-            pool_end = pool_start + N  # exclusive
+            pool_end = pool_end_rwi if just_before_target else n_pool0  # exclusive
 
             # Read SBP/DBP for the pool windows ONLY (cheap, no target-period reads).
             pool_sbp: list = []
@@ -501,6 +532,10 @@ def select_calibration_pairs(file_list, output_pairs_path: Optional[str] = None,
             # One fixed (cal_low, cal_high) pair per master, pinned to every target at rwi >= pool_end.
             n_targets = 0
             for i in range(pool_end, n_total):
+                if (max_gap_windows is not None and gap_policy == "drop_late"
+                        and clock[i] - clock[pool_end - 1] > gap_limit):
+                    n_targets_dropped_by_gap += 1
+                    continue
                 target_path = str(rows.loc[i, "npz_path"])
                 # Defensive: a target must never use itself as a cal source.
                 if target_path == cal_low_path or target_path == cal_high_path:
@@ -739,7 +774,8 @@ def filter_target_lists(train_l, val_l, test_l, valid_sids):
     def _keep(fp):
         if fp not in _WINDOW_CAL_PAIRS:
             return False
-        if get_record_window_index(fp) < CALIBRATION_WINDOW_COUNT:
+        if (str(CALIBRATION_POOL_TIME_MODE).lower() == "cumulative"
+                and get_record_window_index(fp) < CALIBRATION_WINDOW_COUNT):
             return False
         return True
 
@@ -1724,6 +1760,9 @@ def save_run_manifest(path, *, run_dir, checkpoint_path, calibration_pairs_path,
                              if use_calibration else "none"),
         "CALIBRATION_POOL_JUST_BEFORE_FIRST_TARGET": bool(CALIBRATION_POOL_JUST_BEFORE_FIRST_TARGET),
         "CALIBRATION_MAX_GAP_MINUTES": float(CALIBRATION_MAX_GAP_MINUTES),
+        "CALIBRATION_TIME_MODE": str(CALIBRATION_TIME_MODE),
+        "CALIBRATION_GAP_POLICY": str(CALIBRATION_GAP_POLICY),
+        "CALIBRATION_POOL_TIME_MODE": str(CALIBRATION_POOL_TIME_MODE),
         "processed_manifest_path": processed_manifest_path,
         "data_lists_path": data_lists_path,
         "abp_normalization_stats_path": abp_stats_path,
